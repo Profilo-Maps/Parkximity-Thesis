@@ -1536,8 +1536,253 @@ class ParkProximityAnalyzer:
         print(f"  Median distance: {median_dist:.2f} km")
         print(f"  95th percentile: {percentile_95:.2f} km")
     
-    def run_full_analysis(self):
-        """Run the complete analysis pipeline."""
+    def calculate_park_betweenness_centrality(self):
+        """
+        Calculate group betweenness centrality for each park using its entrance nodes.
+        
+        Group betweenness centrality measures how important a group of nodes (park entrances)
+        is for connecting other nodes in the network. Higher values indicate parks that are
+        more critical for network connectivity.
+        
+        Returns:
+        --------
+        pd.DataFrame : DataFrame with park names/IDs and their betweenness centrality scores
+        """
+        print("Calculating group betweenness centrality for parks...")
+        
+        if self.network_graph is None:
+            print("ERROR: Network graph not built yet. Call build_network() first.")
+            return None
+        
+        if self.entrances_gdf is None or len(self.entrances_gdf) == 0:
+            print("ERROR: No park entrances available for betweenness calculation.")
+            return None
+        
+        # Map entrance points to their nearest network nodes
+        print("  Mapping entrances to network nodes...")
+        network_nodes_array = np.array(list(self.network_graph.nodes()))
+        tree = cKDTree(network_nodes_array)
+        
+        entrance_coords = np.array([(geom.x, geom.y) for geom in self.entrances_gdf.geometry])
+        distances, indices = tree.query(entrance_coords)
+        
+        # Create mapping of park_id to set of network nodes
+        park_entrance_nodes = {}
+        for i, row in self.entrances_gdf.iterrows():
+            park_id = row['park_id']
+            park_name = row['park_name']
+            network_node = tuple(network_nodes_array[indices[i]])
+            
+            if park_id not in park_entrance_nodes:
+                park_entrance_nodes[park_id] = {
+                    'name': park_name,
+                    'nodes': set()
+                }
+            park_entrance_nodes[park_id]['nodes'].add(network_node)
+        
+        print(f"  Mapped entrances to nodes for {len(park_entrance_nodes)} parks")
+        
+        # Calculate group betweenness centrality for each park
+        print("  Computing group betweenness centrality (this may take several minutes)...")
+        park_betweenness = []
+        total_parks = len(park_entrance_nodes)
+        
+        for idx, (park_id, park_data) in enumerate(park_entrance_nodes.items()):
+            if (idx + 1) % 50 == 0 or idx == 0:
+                print(f"    Progress: {idx + 1}/{total_parks} parks")
+            
+            park_name = park_data['name']
+            entrance_nodes = park_data['nodes']
+            
+            try:
+                # Calculate group betweenness centrality
+                # This measures how many shortest paths pass through this group of nodes
+                group_bc = nx.group_betweenness_centrality(
+                    self.network_graph,
+                    C=entrance_nodes,
+                    weight='weight',
+                    normalized=True
+                )
+                
+                park_betweenness.append({
+                    'park_id': park_id,
+                    'park_name': park_name,
+                    'num_entrances': len(entrance_nodes),
+                    'betweenness_centrality': group_bc
+                })
+                
+            except Exception as e:
+                print(f"    Warning: Error calculating betweenness for park '{park_name}': {str(e)[:50]}")
+                park_betweenness.append({
+                    'park_id': park_id,
+                    'park_name': park_name,
+                    'num_entrances': len(entrance_nodes),
+                    'betweenness_centrality': 0.0
+                })
+        
+        # Create DataFrame with results
+        betweenness_df = pd.DataFrame(park_betweenness)
+        betweenness_df = betweenness_df.sort_values('betweenness_centrality', ascending=False)
+        
+        print(f"  Completed betweenness centrality calculation")
+        print(f"  Top 5 parks by betweenness centrality:")
+        for idx, row in betweenness_df.head(5).iterrows():
+            print(f"    {row['park_name']}: {row['betweenness_centrality']:.6f} ({row['num_entrances']} entrances)")
+        
+        # Store results
+        self.park_betweenness_df = betweenness_df
+        
+        # Save to CSV
+        output_dir = Path(self.config['output_dir'])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        csv_filename = output_dir / f"{self.city_name.lower().replace(' ', '_')}_park_betweenness.csv"
+        betweenness_df.to_csv(csv_filename, index=False)
+        print(f"  Saved betweenness centrality results to {csv_filename}")
+        
+        return betweenness_df
+    
+    def visualize_park_betweenness(self):
+        """
+        Create visualizations for park betweenness centrality results.
+        """
+        if not hasattr(self, 'park_betweenness_df') or self.park_betweenness_df is None:
+            print("ERROR: No betweenness centrality data. Run calculate_park_betweenness_centrality() first.")
+            return
+        
+        print("Creating betweenness centrality visualizations...")
+        output_dir = Path(self.config['output_dir'])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        base_filename = output_dir / f"{self.city_name.lower().replace(' ', '_')}_park_betweenness"
+        
+        # 1. Bar chart of top 20 parks
+        print("  Creating bar chart...")
+        fig, ax = plt.subplots(figsize=(12, 10))
+        
+        top_20 = self.park_betweenness_df.head(20)
+        bars = ax.barh(range(len(top_20)), top_20['betweenness_centrality'], color='steelblue', alpha=0.7)
+        ax.set_yticks(range(len(top_20)))
+        ax.set_yticklabels(top_20['park_name'], fontsize=9)
+        ax.set_xlabel('Group Betweenness Centrality', fontsize=11, fontweight='bold')
+        ax.set_title(f'Top 20 Parks by Betweenness Centrality - {self.city_name}', 
+                     fontsize=13, fontweight='bold', pad=15)
+        ax.grid(True, alpha=0.3, axis='x')
+        ax.invert_yaxis()
+        
+        # Add value labels on bars
+        for i, (bar, val) in enumerate(zip(bars, top_20['betweenness_centrality'])):
+            ax.text(val, bar.get_y() + bar.get_height()/2, f'{val:.6f}',
+                   va='center', ha='left', fontsize=7, color='black')
+        
+        plt.tight_layout()
+        plt.savefig(f'{base_filename}_top20_bar.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved bar chart to {base_filename}_top20_bar.png")
+        
+        # 2. Map visualization with parks colored by betweenness centrality
+        print("  Creating spatial map...")
+        fig, ax = plt.subplots(figsize=(15, 15))
+        
+        # Plot streets
+        if self.streets_gdf is not None:
+            self.streets_gdf.plot(ax=ax, color='gray', linewidth=0.4, alpha=0.5, zorder=1)
+        
+        # Merge betweenness data with parks geodataframe
+        parks_with_bc = self.parks_gdf.copy()
+        parks_with_bc['betweenness_centrality'] = parks_with_bc.index.map(
+            lambda idx: self.park_betweenness_df[
+                self.park_betweenness_df['park_id'] == idx
+            ]['betweenness_centrality'].values[0] 
+            if idx in self.park_betweenness_df['park_id'].values else 0.0
+        )
+        
+        # Plot parks colored by betweenness centrality
+        parks_with_bc.plot(
+            ax=ax,
+            column='betweenness_centrality',
+            cmap='YlOrRd',
+            edgecolor='black',
+            linewidth=0.5,
+            alpha=0.7,
+            legend=True,
+            legend_kwds={'label': 'Group Betweenness Centrality', 'shrink': 0.7},
+            zorder=2
+        )
+        
+        # Plot boundary
+        if self.boundary_gdf is not None:
+            self.boundary_gdf.plot(ax=ax, facecolor='none', edgecolor='black', linewidth=1.5, zorder=3)
+        
+        ax.set_title(f'Parks by Betweenness Centrality - {self.city_name}', 
+                     fontsize=16, fontweight='bold')
+        ax.set_xlabel('')
+        ax.set_ylabel('')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_aspect('equal')
+        
+        # Add info box
+        info_text = (
+            f"Betweenness Centrality Analysis\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Parks analyzed: {len(self.park_betweenness_df)}\n"
+            f"Mean BC: {self.park_betweenness_df['betweenness_centrality'].mean():.6f}\n"
+            f"Max BC: {self.park_betweenness_df['betweenness_centrality'].max():.6f}\n"
+            f"\n"
+            f"Interpretation:\n"
+            f"Higher values indicate parks whose\n"
+            f"entrances are more critical for\n"
+            f"network connectivity"
+        )
+        ax.text(
+            0.02, 0.98,
+            info_text,
+            transform=ax.transAxes,
+            bbox=dict(facecolor='white', alpha=0.9, edgecolor='black', boxstyle='round,pad=0.5'),
+            verticalalignment='top',
+            fontsize=9,
+            family='monospace'
+        )
+        
+        plt.tight_layout()
+        plt.savefig(f'{base_filename}_map.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved spatial map to {base_filename}_map.png")
+        
+        # 3. Distribution histogram
+        print("  Creating distribution histogram...")
+        fig, ax = plt.subplots(figsize=(12, 8))
+        
+        ax.hist(
+            self.park_betweenness_df['betweenness_centrality'],
+            bins=50,
+            color='steelblue',
+            alpha=0.7,
+            edgecolor='black',
+            linewidth=0.5
+        )
+        
+        mean_bc = self.park_betweenness_df['betweenness_centrality'].mean()
+        median_bc = self.park_betweenness_df['betweenness_centrality'].median()
+        
+        ax.axvline(mean_bc, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_bc:.6f}')
+        ax.axvline(median_bc, color='orange', linestyle='--', linewidth=2, label=f'Median: {median_bc:.6f}')
+        
+        ax.set_xlabel('Group Betweenness Centrality', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Number of Parks', fontsize=12, fontweight='bold')
+        ax.set_title(f'Distribution of Park Betweenness Centrality - {self.city_name}',
+                     fontsize=14, fontweight='bold', pad=20)
+        ax.legend(loc='upper right', fontsize=10)
+        ax.grid(True, alpha=0.3, linestyle=':', linewidth=0.5)
+        
+        plt.tight_layout()
+        plt.savefig(f'{base_filename}_distribution.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved distribution histogram to {base_filename}_distribution.png")
+        
+        print("Betweenness centrality visualizations complete!")
+    
+    def run_full_analysis_with_betweenness(self):
+        """Run the complete analysis pipeline including betweenness centrality."""
         print(f"\n{'='*60}")
         print(f"Starting analysis for {self.city_name}")
         print(f"{'='*60}\n")
@@ -1548,7 +1793,14 @@ class ParkProximityAnalyzer:
         self.calculate_parcel_distances()
         self.create_visualizations()
         
-        print(f"\nAnalysis complete for {self.city_name}!")
+        # Additional betweenness centrality analysis
+        print(f"\n{'='*60}")
+        print(f"Running betweenness centrality analysis")
+        print(f"{'='*60}\n")
+        self.calculate_park_betweenness_centrality()
+        self.visualize_park_betweenness()
+        
+        print(f"\nComplete analysis (with betweenness) finished for {self.city_name}!")
         return self.parcels_gdf
 
 
@@ -1569,7 +1821,7 @@ def run_multi_city_analysis(cities_config):
     
     for city_name, config in cities_config.items():
         analyzer = ParkProximityAnalyzer(city_name, config)
-        results[city_name] = analyzer.run_full_analysis()
+        results[city_name] = analyzer.run_full_analysis_with_betweenness()
     
     return results
 
