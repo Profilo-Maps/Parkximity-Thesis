@@ -8,15 +8,20 @@ from scipy.spatial import cKDTree
 from scipy.ndimage import gaussian_filter
 from shapely.geometry import Point, LineString, MultiPolygon
 from shapely import wkt
-from pyproj import Transformer
 import heapq
 from pathlib import Path
+
+# Standard projected CRS for all US analysis (NAD83(2011) / Conus Albers - meters)
+TARGET_CRS = "EPSG:6350"
 
 
 class ParkProximityAnalyzer:
     """
     Analyzes park accessibility for a city using street network analysis
     and creates heatmap visualizations.
+    
+    All input data is automatically reprojected to EPSG:6350 (NAD83(2011) / Conus Albers)
+    which uses meters as the unit of measurement and works for the entire contiguous US.
     """
     
     def __init__(self, city_name, config):
@@ -29,17 +34,22 @@ class ParkProximityAnalyzer:
             Name of the city being analyzed
         config : dict
             Configuration dictionary containing:
-                - parcels_path: Path to parcels CSV
+                - parcels_path: Path to parcels GeoJSON/CSV
                 - parks_path: Path to parks GeoJSON
                 - streets_path: Path to streets GeoJSON
-                - boundary_path: Path to county boundary CSV (optional)
-                - source_crs: Source coordinate reference system (e.g., "EPSG:4326")
-                - target_crs: Target CRS for analysis (e.g., "EPSG:2227")
+                - boundary_path: Path to boundary GeoJSON/CSV (optional)
                 - output_dir: Directory for output files
                 - combine_boundaries: Boolean, if True combines neighborhood polygons into city boundary
+                - lts_column: Column name for LTS values in streets data
+                - park_buffer: Buffer distance in meters for park entrance detection (default 50)
+                - entrance_tolerance: Tolerance in meters for deduplicating entrances (default 5)
+                - heatmap_resolution: Resolution for heatmap grid (default 100)
+                - heatmap_neighbors: Number of neighbors for interpolation (default 5)
+                - heatmap_smoothing: Gaussian smoothing sigma (default 1)
         """
         self.city_name = city_name
         self.config = config
+        self.target_crs = TARGET_CRS
         self.parcels_gdf = None
         self.parks_gdf = None
         self.streets_gdf = None
@@ -49,9 +59,41 @@ class ParkProximityAnalyzer:
         self.distances_dict = None
         self.paths_dict = None
         
+    def _load_and_reproject(self, filepath, description="data"):
+        """
+        Load a GeoJSON/shapefile and reproject to target CRS.
+        
+        Parameters:
+        -----------
+        filepath : str
+            Path to the geospatial file
+        description : str
+            Description for logging purposes
+            
+        Returns:
+        --------
+        GeoDataFrame : Loaded and reprojected data
+        """
+        gdf = gpd.read_file(filepath)
+        source_crs = gdf.crs
+        
+        if source_crs is None:
+            print(f"  Warning: {description} has no CRS defined, assuming EPSG:4326")
+            gdf = gdf.set_crs("EPSG:4326")
+            source_crs = gdf.crs
+        
+        print(f"  {description}: loaded from {source_crs}, reprojecting to {self.target_crs}")
+        
+        # Check if source is geographic (will cause issues with meter-based operations)
+        if source_crs.is_geographic:
+            print(f"    Note: Source CRS is geographic (lat/lon). Reprojection required for accurate distance calculations.")
+        
+        return gdf.to_crs(self.target_crs)
+        
     def load_data(self):
-        """Load all required data files and transform to target CRS."""
+        """Load all required data files and transform to target CRS (EPSG:6350)."""
         print(f"Loading data for {self.city_name}...")
+        print(f"Target CRS: {self.target_crs} (NAD83(2011) / Conus Albers - meters)")
         
         # Load boundary first (if available) so we can clip parcels
         if 'boundary_path' in self.config and self.config['boundary_path']:
@@ -61,7 +103,7 @@ class ParkProximityAnalyzer:
         self._load_parcels()
         
         # Load parks and filter to polygons only
-        parks_raw = gpd.read_file(self.config['parks_path']).to_crs(self.config['target_crs'])
+        parks_raw = self._load_and_reproject(self.config['parks_path'], "Parks")
         print(f"Loaded {len(parks_raw)} parks from file")
         
         # Filter to only polygon geometries
@@ -118,7 +160,7 @@ class ParkProximityAnalyzer:
             print("ERROR: No valid parks after geometry repair!")
             raise ValueError("No valid polygon parks available for analysis")
         
-        parks_validated = gpd.GeoDataFrame(valid_parks, crs=self.config['target_crs'])
+        parks_validated = gpd.GeoDataFrame(valid_parks, crs=self.target_crs)
         
         if repaired_count > 0:
             print(f"Repaired {repaired_count} invalid park geometries")
@@ -134,10 +176,6 @@ class ParkProximityAnalyzer:
             print(f"Clipping parks to {self.city_name} boundary...")
             original_park_count = len(parks_validated)
             
-            # Ensure both are in the same CRS
-            if parks_validated.crs != self.boundary_gdf.crs:
-                self.boundary_gdf = self.boundary_gdf.to_crs(parks_validated.crs)
-            
             # Clip parks to boundary - keep only parts within boundary
             try:
                 self.parks_gdf = gpd.clip(parks_validated, self.boundary_gdf)
@@ -147,7 +185,6 @@ class ParkProximityAnalyzer:
                 
                 if len(self.parks_gdf) == 0:
                     print("WARNING: No parks remain after clipping! Check that:")
-                    print("  - Boundary and parks are in compatible coordinate systems")
                     print("  - Boundary polygon correctly represents the city area")
                     print("  - Park coordinates are correct")
             except Exception as e:
@@ -160,14 +197,36 @@ class ParkProximityAnalyzer:
         print(f"Final park count: {len(self.parks_gdf)} valid polygon parks")
         
         # Load streets
-        self.streets_gdf = gpd.read_file(self.config['streets_path']).to_crs(self.config['target_crs'])
+        self.streets_gdf = self._load_and_reproject(self.config['streets_path'], "Streets")
         print(f"Loaded {len(self.streets_gdf)} street segments")
+        
+        # Verify CRS consistency
+        self._verify_crs_consistency()
         
         # Create diagnostic map before generating entrances
         self._create_diagnostic_map()
         
         # Load park entrances (generate from street-park intersections)
         self._generate_entrances()
+    
+    def _verify_crs_consistency(self):
+        """Verify all loaded data is in the target CRS."""
+        datasets = [
+            ('Parks', self.parks_gdf),
+            ('Streets', self.streets_gdf),
+            ('Parcels', self.parcels_gdf),
+            ('Boundary', self.boundary_gdf)
+        ]
+        
+        all_consistent = True
+        for name, gdf in datasets:
+            if gdf is not None and len(gdf) > 0:
+                if gdf.crs != self.target_crs:
+                    print(f"WARNING: {name} CRS mismatch! Expected {self.target_crs}, got {gdf.crs}")
+                    all_consistent = False
+        
+        if all_consistent:
+            print(f"CRS verification passed: all datasets in {self.target_crs}")
     
     def _create_diagnostic_map(self):
         """Create a map showing streets and parks before entrance generation."""
@@ -249,7 +308,7 @@ class ParkProximityAnalyzer:
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Parks: {len(self.parks_gdf)}\n"
             f"Streets: {len(self.streets_gdf)}\n"
-            f"CRS: {self.parks_gdf.crs}\n"
+            f"CRS: {self.target_crs}\n"
             f"\n"
             f"Parks bounds:\n"
             f"  X: [{self.parks_gdf.total_bounds[0]:.2f}, {self.parks_gdf.total_bounds[2]:.2f}]\n"
@@ -276,7 +335,7 @@ class ParkProximityAnalyzer:
         print(f"  → Check this map to verify streets and parks overlap spatially")
     
     def _load_parcels(self):
-        """Load and process parcel data with coordinate transformation and optional clipping."""
+        """Load and process parcel data with automatic CRS detection and optional clipping."""
         parcels_path = self.config['parcels_path']
         
         # Check if parcels file is GeoJSON or CSV
@@ -300,12 +359,20 @@ class ParkProximityAnalyzer:
                         if len(w) > 3:
                             print(f"    ... and {len(w) - 3} more warnings")
                 
+                # Log and reproject
+                source_crs = parcels_gdf_raw.crs
+                if source_crs is None:
+                    print(f"  Warning: Parcels have no CRS defined, assuming EPSG:4326")
+                    parcels_gdf_raw = parcels_gdf_raw.set_crs("EPSG:4326")
+                    source_crs = parcels_gdf_raw.crs
+                
+                print(f"  Parcels: loaded from {source_crs}, reprojecting to {self.target_crs}")
                 print(f"  Successfully loaded {len(parcels_gdf_raw)} parcels (some may have None geometry)")
                 
             except Exception as e:
                 print(f"  Error loading parcels: {e}")
                 print(f"  Creating empty parcel dataset - analysis will continue without parcels")
-                self.parcels_gdf = gpd.GeoDataFrame(geometry=[], crs=self.config['target_crs'])
+                self.parcels_gdf = gpd.GeoDataFrame(geometry=[], crs=self.target_crs)
                 return
             
             # Filter out parcels with invalid or None geometries
@@ -359,12 +426,12 @@ class ParkProximityAnalyzer:
                 
                 valid_indices.append(idx)
             
-            # Keep only valid parcels
+            # Keep only valid parcels and reproject
             if len(valid_indices) > 0:
-                self.parcels_gdf = parcels_gdf_raw.iloc[valid_indices].copy().to_crs(self.config['target_crs'])
+                self.parcels_gdf = parcels_gdf_raw.loc[valid_indices].copy().to_crs(self.target_crs)
             else:
                 print(f"  Warning: No valid parcels found!")
-                self.parcels_gdf = gpd.GeoDataFrame(geometry=[], crs=self.config['target_crs'])
+                self.parcels_gdf = gpd.GeoDataFrame(geometry=[], crs=self.target_crs)
             
             if invalid_count > 0:
                 print(f"  Skipped {invalid_count} parcels with invalid/None geometries")
@@ -378,12 +445,8 @@ class ParkProximityAnalyzer:
             print("Loading parcels from CSV...")
             parcels_df = pd.read_csv(parcels_path, engine='python', on_bad_lines='warn')
             
-            # Create transformer
-            transformer = Transformer.from_crs(
-                self.config.get('source_crs', 'EPSG:4326'),
-                self.config['target_crs'],
-                always_xy=False
-            )
+            # Assume CSV coordinates are in WGS84 (EPSG:4326)
+            print(f"  Assuming CSV coordinates are in EPSG:4326 (WGS84 lat/lon)")
             
             # Transform coordinates
             geometries = []
@@ -397,18 +460,21 @@ class ParkProximityAnalyzer:
                     if pd.isna(lat) or pd.isna(lon):
                         continue
                     
-                    x, y = transformer.transform(lat, lon)
-                    geometries.append(Point(x, y))
+                    # Create point in WGS84
+                    geometries.append(Point(lon, lat))
                     valid_indices.append(idx)
                 except Exception:
                     continue
             
             valid_parcels_df = parcels_df.iloc[valid_indices].copy()
+            
+            # Create GeoDataFrame in WGS84 then reproject
             self.parcels_gdf = gpd.GeoDataFrame(
                 valid_parcels_df,
                 geometry=geometries,
-                crs=self.config['target_crs']
-            )
+                crs="EPSG:4326"
+            ).to_crs(self.target_crs)
+            
             print(f"Loaded {len(self.parcels_gdf)} valid parcels from CSV")
         
         # Clip parcels to boundary if boundary is available
@@ -420,10 +486,6 @@ class ParkProximityAnalyzer:
         print(f"Clipping parcels to {self.city_name} boundary...")
         
         original_count = len(self.parcels_gdf)
-        
-        # Ensure both are in the same CRS
-        if self.parcels_gdf.crs != self.boundary_gdf.crs:
-            self.boundary_gdf = self.boundary_gdf.to_crs(self.parcels_gdf.crs)
         
         # Use spatial join or clip to keep only parcels within the boundary
         # Using sjoin is more efficient for point data
@@ -445,7 +507,6 @@ class ParkProximityAnalyzer:
         
         if len(self.parcels_gdf) == 0:
             print("WARNING: No parcels remain after clipping! Check that:")
-            print("  - Boundary and parcels are in compatible coordinate systems")
             print("  - Boundary polygon correctly represents the city area")
             print("  - Parcel coordinates are correct")
     
@@ -459,26 +520,29 @@ class ParkProximityAnalyzer:
         # Verify we have parks and streets to work with
         if len(self.parks_gdf) == 0:
             print("ERROR: No parks available for entrance generation!")
-            self.entrances_gdf = gpd.GeoDataFrame(geometry=[], crs=self.config['target_crs'])
+            self.entrances_gdf = gpd.GeoDataFrame(geometry=[], crs=self.target_crs)
             return
         
         if len(self.streets_gdf) == 0:
             print("ERROR: No streets available for entrance generation!")
-            self.entrances_gdf = gpd.GeoDataFrame(geometry=[], crs=self.config['target_crs'])
+            self.entrances_gdf = gpd.GeoDataFrame(geometry=[], crs=self.target_crs)
             return
         
-        # Verify CRS match
-        if self.parks_gdf.crs != self.streets_gdf.crs:
-            print(f"WARNING: CRS mismatch detected!")
-            print(f"  Parks CRS: {self.parks_gdf.crs}")
-            print(f"  Streets CRS: {self.streets_gdf.crs}")
-            print(f"  Converting parks to streets CRS...")
-            self.parks_gdf = self.parks_gdf.to_crs(self.streets_gdf.crs)
+        # Verify CRS is projected (not geographic) for accurate buffer distances
+        if self.parks_gdf.crs.is_geographic:
+            print("ERROR: Parks are in a geographic CRS (lat/lon degrees)!")
+            print("  Buffer distances would be interpreted as degrees, not meters.")
+            print("  This should not happen - please report this bug.")
+            raise ValueError("Cannot use geographic CRS for park entrance generation")
         
         # Get buffer distance from config (default 50 meters)
         buffer_distance = self.config.get('park_buffer', 50.0)
         print(f"Using buffer distance: {buffer_distance} meters")
         print(f"Processing {len(self.parks_gdf)} polygon parks")
+        
+        # Build spatial index for streets (speeds up intersection queries significantly)
+        print("  Building spatial index for streets...")
+        streets_sindex = self.streets_gdf.sindex
         
         entrance_points = []
         entrance_data = []
@@ -493,8 +557,15 @@ class ParkProximityAnalyzer:
             # Buffer park to find intersecting streets
             buffered_park = park_geom.buffer(buffer_distance)
             
-            # Find all streets that intersect with the buffered park
-            intersecting_streets = self.streets_gdf[self.streets_gdf.intersects(buffered_park)]
+            # Use spatial index to find candidate streets (much faster than checking all)
+            candidate_idx = list(streets_sindex.intersection(buffered_park.bounds))
+            if len(candidate_idx) == 0:
+                parks_without_entrances.append(park_name)
+                continue
+            
+            # Filter candidates to those that actually intersect
+            candidate_streets = self.streets_gdf.iloc[candidate_idx]
+            intersecting_streets = candidate_streets[candidate_streets.intersects(buffered_park)]
             
             if len(intersecting_streets) == 0:
                 parks_without_entrances.append(park_name)
@@ -622,7 +693,7 @@ class ParkProximityAnalyzer:
             print(f"Parks without entrances: {len(parks_without_entrances)}")
             print(f"  Possible reasons: too small, no streets nearby, or disconnected from network")
             if len(parks_without_entrances) <= 5:
-                print(f"  Examples: {', '.join(parks_without_entrances[:5])}")
+                print(f"  Examples: {', '.join(str(p) for p in parks_without_entrances[:5])}")
         
         # Store parks without entrances for diagnostic mapping
         self.parks_without_entrances = parks_without_entrances
@@ -630,15 +701,13 @@ class ParkProximityAnalyzer:
         if len(entrance_points) == 0:
             print("ERROR: No street-park intersections found!")
             print("This could mean:")
-            print("  - Parks and streets are in different coordinate systems")
             print("  - Park polygons don't overlap with street network")
             print("  - Parks are too small or streets don't reach them")
             print("  - Data quality issues with park or street geometries")
             print("\nDebugging info:")
             print(f"  Number of parks: {len(self.parks_gdf)}")
             print(f"  Number of streets: {len(self.streets_gdf)}")
-            print(f"  Parks CRS: {self.parks_gdf.crs}")
-            print(f"  Streets CRS: {self.streets_gdf.crs}")
+            print(f"  CRS: {self.target_crs}")
             print(f"  Parks bounds: {self.parks_gdf.total_bounds}")
             print(f"  Streets bounds: {self.streets_gdf.total_bounds}")
             
@@ -648,44 +717,70 @@ class ParkProximityAnalyzer:
                 park_name = park.get('name', park.get('NAME', f'Park_{idx}'))
                 print(f"  Park: {park_name}")
                 print(f"    Type: {park.geometry.geom_type}")
-                print(f"    Area: {park.geometry.area:.2f}")
+                print(f"    Area: {park.geometry.area:.2f} sq meters")
                 print(f"    Bounds: {park.geometry.bounds}")
                 
                 # Check if any streets are nearby
-                buffered = park.geometry.buffer(50)  # 50 meter buffer
+                buffered = park.geometry.buffer(buffer_distance)
                 nearby = self.streets_gdf[self.streets_gdf.intersects(buffered)]
-                print(f"    Streets within 50m: {len(nearby)}")
+                print(f"    Streets within {buffer_distance}m: {len(nearby)}")
             
             # Create empty GeoDataFrame
             self.entrances_gdf = gpd.GeoDataFrame(
                 geometry=[],
-                crs=self.config['target_crs']
+                crs=self.target_crs
             )
             return
         
-        # Remove duplicate points (within a small tolerance)
-        unique_points = []
-        unique_data = []
-        tolerance = self.config.get('entrance_tolerance', 1.0)  # 1 meter default
+        # Remove duplicate points (within a small tolerance) using KD-tree for efficiency
+        tolerance = self.config.get('entrance_tolerance', 5.0)  # 5 meter default
         
+        print(f"Removing duplicate entrances within {tolerance}m (processing {len(entrance_points)} points)...")
+        
+        # Filter out None/empty points first
+        valid_points = []
+        valid_data = []
         for i, point in enumerate(entrance_points):
-            # Skip None points
-            if point is None or point.is_empty:
-                continue
-                
-            is_duplicate = False
-            for existing_point in unique_points:
-                if existing_point is not None and point.distance(existing_point) < tolerance:
-                    is_duplicate = True
-                    break
-            if not is_duplicate:
-                unique_points.append(point)
-                unique_data.append(entrance_data[i])
+            if point is not None and not point.is_empty:
+                valid_points.append(point)
+                valid_data.append(entrance_data[i])
+        
+        if len(valid_points) == 0:
+            unique_points = []
+            unique_data = []
+        else:
+            # Convert to numpy array for KD-tree
+            coords = np.array([[p.x, p.y] for p in valid_points])
+            
+            # Build KD-tree
+            tree = cKDTree(coords)
+            
+            # Find all pairs within tolerance
+            # query_ball_tree returns indices of points within distance
+            pairs = tree.query_ball_tree(tree, r=tolerance)
+            
+            # Keep only the first point in each cluster
+            kept_indices = set()
+            removed_indices = set()
+            
+            for i, neighbors in enumerate(pairs):
+                if i in removed_indices:
+                    continue
+                # Keep this point
+                kept_indices.add(i)
+                # Mark all its neighbors (except itself) as duplicates
+                for j in neighbors:
+                    if j != i:
+                        removed_indices.add(j)
+            
+            # Extract unique points
+            unique_points = [valid_points[i] for i in sorted(kept_indices)]
+            unique_data = [valid_data[i] for i in sorted(kept_indices)]
         
         self.entrances_gdf = gpd.GeoDataFrame(
             unique_data,
             geometry=unique_points,
-            crs=self.config['target_crs']
+            crs=self.target_crs
         )
         
         print(f"Generated {len(self.entrances_gdf)} unique park entrance points")
@@ -710,6 +805,14 @@ class ParkProximityAnalyzer:
         
         # Load the GeoJSON file
         boundary_gdf = gpd.read_file(self.config['boundary_path'])
+        
+        # Log source CRS
+        source_crs = boundary_gdf.crs
+        if source_crs is None:
+            print(f"  Warning: Boundary has no CRS defined, assuming EPSG:4326")
+            boundary_gdf = boundary_gdf.set_crs("EPSG:4326")
+            source_crs = boundary_gdf.crs
+        print(f"  Boundary: loaded from {source_crs}, will reproject to {self.target_crs}")
         
         # Check if we need to filter by city/county name
         if 'boundary_name' in self.config and self.config['boundary_name']:
@@ -772,11 +875,11 @@ class ParkProximityAnalyzer:
                 if isinstance(combined_boundary, MultiPolygon):
                     combined_boundary = max(combined_boundary.geoms, key=lambda a: a.area)
         
-        # Create GeoDataFrame with the boundary
+        # Create GeoDataFrame with the boundary and reproject
         self.boundary_gdf = gpd.GeoDataFrame(
             geometry=[combined_boundary],
             crs=boundary_gdf.crs
-        ).to_crs(self.config['target_crs'])
+        ).to_crs(self.target_crs)
         print(f"Loaded boundary for {self.city_name}")
     
     def _load_boundary_from_csv(self):
@@ -786,6 +889,10 @@ class ParkProximityAnalyzer:
         county_df = pd.read_csv(self.config['boundary_path'])
         wkt_column = self.config.get('boundary_wkt_column', 'the_geom')
         county_column = self.config.get('boundary_county_column', 'COUNTY')
+        
+        # Assume CSV WKT is in WGS84 unless specified
+        csv_crs = self.config.get('boundary_csv_crs', 'EPSG:4326')
+        print(f"  Assuming CSV coordinates are in {csv_crs}")
         
         # Check if we need to combine neighborhood boundaries
         combine_boundaries = self.config.get('combine_boundaries', False)
@@ -839,10 +946,11 @@ class ParkProximityAnalyzer:
             if isinstance(combined_boundary, MultiPolygon):
                 combined_boundary = max(combined_boundary.geoms, key=lambda a: a.area)
         
+        # Create GeoDataFrame and reproject
         self.boundary_gdf = gpd.GeoDataFrame(
             geometry=[combined_boundary],
-            crs=self.config.get('source_crs', 'EPSG:4326')
-        ).to_crs(self.config['target_crs'])
+            crs=csv_crs
+        ).to_crs(self.target_crs)
         print(f"Loaded boundary for {self.city_name}")
     
     def _combine_neighborhood_polygons(self, polygons):
@@ -899,409 +1007,316 @@ class ParkProximityAnalyzer:
                 line_geom = LineString([start, end])
                 length = line_geom.length
                 
-                if length > 0:
-                    weight_val = length * weight
-                    all_edges.append((
-                        start, end,
-                        {'weight': weight_val, 'lts_value': weight, 'length': length}
-                    ))
+                # Skip invalid/zero-length segments
+                if length <= 0 or np.isnan(weight):
+                    continue
+                
+                # Weight by LTS value (higher LTS = less desirable = higher cost)
+                weighted_length = length * (1 + weight)
+                
+                all_edges.append((start, end, {
+                    'weight': weighted_length,
+                    'length': length,
+                    'lts': weight
+                }))
         
         self.network_graph.add_edges_from(all_edges)
-        print(f"Graph created with {self.network_graph.number_of_nodes()} nodes "
-              f"and {self.network_graph.number_of_edges()} edges")
+        print(f"Graph created with {self.network_graph.number_of_nodes()} nodes and {self.network_graph.number_of_edges()} edges")
     
     def calculate_distances(self):
-        """Calculate distances from all network nodes to nearest park entrance."""
+        """Calculate network distances from all nodes to nearest park entrance."""
         print("Calculating network distances to parks...")
         
-        # Check if we have any park entrances
-        if self.entrances_gdf is None or len(self.entrances_gdf) == 0:
-            print("ERROR: No park entrances found!")
-            print("This means the street network does not intersect with any park polygons.")
-            print("Possible causes:")
-            print("  1. Parks and streets are in different coordinate systems (CRS mismatch)")
-            print("  2. Parks are very small and don't touch the street network")
-            print("  3. Street or park data quality issues")
-            print("  4. Parks were clipped out by the boundary")
-            print("\nTroubleshooting steps:")
-            print("  - Verify parks_gdf and streets_gdf have the same CRS")
-            print("  - Check if parks and streets visually overlap in QGIS")
-            print("  - Try increasing buffer around parks for intersection detection")
-            raise ValueError("No park entrances generated - cannot calculate distances")
+        if len(self.entrances_gdf) == 0:
+            print("Warning: No park entrances available. Distances will be infinite.")
+            self.distances_dict = {}
+            return
         
-        # Get source nodes (nearest to park entrances)
-        network_nodes_array = np.array(list(self.network_graph.nodes()))
-        point_coords = np.array([(geom.x, geom.y) for geom in self.entrances_gdf.geometry])
+        # Get entrance coordinates as source nodes using KD-tree for efficiency
+        print(f"Finding nearest network nodes for {len(self.entrances_gdf)} park entrances...")
         
-        if len(point_coords) == 0:
-            raise ValueError("Park entrances GeoDataFrame is empty - cannot calculate distances")
+        # Build KD-tree of network nodes
+        nodes_list = list(self.network_graph.nodes())
+        nodes_array = np.array(nodes_list)
+        tree = cKDTree(nodes_array)
         
-        tree = cKDTree(network_nodes_array)
-        distances, indices = tree.query(point_coords)
-        source_nodes = [tuple(network_nodes_array[i]) for i in indices]
-        source_nodes = list(set(source_nodes))
+        # Get entrance coordinates
+        entrance_coords = np.array([[p.x, p.y] for p in self.entrances_gdf.geometry])
+        
+        # Find nearest network node for each entrance (vectorized, very fast)
+        _, indices = tree.query(entrance_coords)
+        
+        # Get unique source nodes
+        source_nodes = set(tuple(nodes_array[i]) for i in indices)
+        
         print(f"Found {len(source_nodes)} unique source nodes from park entrances")
         
-        # Run Dijkstra's algorithm with progress tracking
+        # Run multi-source Dijkstra from all park entrances
         print("Running Dijkstra's algorithm (this may take a few minutes for large networks)...")
-        distances = {}
-        paths = {}
-        lts_sums = {}
         
+        # Initialize distances
+        self.distances_dict = {node: float('inf') for node in self.network_graph.nodes()}
+        
+        # Priority queue: (distance, node)
+        pq = []
+        
+        # Initialize all source nodes with distance 0
         for source in source_nodes:
-            distances[source] = 0
-            paths[source] = [source]
-            lts_sums[source] = 0
+            self.distances_dict[source] = 0
+            heapq.heappush(pq, (0, source))
         
-        queue = [(0, 0, source) for source in source_nodes]
         visited = set()
+        total_nodes = len(self.network_graph.nodes())
+        processed = 0
+        last_percent = 0
         
-        # Progress tracking
-        total_nodes = self.network_graph.number_of_nodes()
-        last_progress = 0
-        
-        while queue:
-            dist, lts_sum, current = heapq.heappop(queue)
+        while pq:
+            dist, node = heapq.heappop(pq)
             
-            if current in visited:
+            if node in visited:
                 continue
             
-            visited.add(current)
+            visited.add(node)
+            processed += 1
             
-            # Print progress every 10%
-            progress = int((len(visited) / total_nodes) * 100)
-            if progress >= last_progress + 10:
-                print(f"  Progress: {progress}% ({len(visited):,}/{total_nodes:,} nodes)")
-                last_progress = progress
+            # Progress update
+            percent = (processed * 100) // total_nodes
+            if percent >= last_percent + 10:
+                print(f"  Progress: {percent}% ({processed:,}/{total_nodes:,} nodes)")
+                last_percent = percent
             
-            for neighbor in self.network_graph.neighbors(current):
+            # Explore neighbors
+            for neighbor in self.network_graph.neighbors(node):
                 if neighbor in visited:
                     continue
                 
-                edge_data = self.network_graph[current][neighbor]
-                edge_length = edge_data['length']
-                edge_lts = edge_data['lts_value']
+                edge_data = self.network_graph.get_edge_data(node, neighbor)
+                new_dist = dist + edge_data['weight']
                 
-                new_dist = distances[current] + edge_length
-                new_lts_sum = lts_sums[current] + edge_lts
-                
-                if neighbor not in distances or new_dist < distances[neighbor] or \
-                   (new_dist == distances[neighbor] and new_lts_sum < lts_sums[neighbor]):
-                    
-                    distances[neighbor] = new_dist
-                    lts_sums[neighbor] = new_lts_sum
-                    paths[neighbor] = paths[current] + [neighbor]
-                    heapq.heappush(queue, (new_dist, new_lts_sum, neighbor))
+                if new_dist < self.distances_dict[neighbor]:
+                    self.distances_dict[neighbor] = new_dist
+                    heapq.heappush(pq, (new_dist, neighbor))
         
-        self.distances_dict = distances
-        self.paths_dict = paths
-        print(f"Calculated distances to {len(self.distances_dict)} nodes (100%)")
+        reachable = sum(1 for d in self.distances_dict.values() if d < float('inf'))
+        print(f"Calculated distances to {reachable} nodes ({reachable * 100 // total_nodes}%)")
     
     def calculate_parcel_distances(self):
-        """Calculate park distances for all parcels."""
+        """Assign park distances to parcels based on nearest network node."""
         print("Calculating parcel distances to parks...")
         
-        network_nodes_array = np.array(list(self.network_graph.nodes()))
-        tree = cKDTree(network_nodes_array)
+        if len(self.parcels_gdf) == 0:
+            print("Warning: No parcels to process.")
+            return
         
-        # Handle both Point and Polygon geometries by using centroids
+        # Build KD-tree of network nodes for fast nearest-neighbor lookup
+        nodes_list = list(self.network_graph.nodes())
+        nodes_array = np.array(nodes_list)
+        tree = cKDTree(nodes_array)
+        
+        # Extract all parcel centroids at once (vectorized)
+        print(f"  Processing {len(self.parcels_gdf)} parcels...")
         parcel_coords = np.array([
-            (geom.centroid.x, geom.centroid.y) if geom.geom_type in ['Polygon', 'MultiPolygon'] 
-            else (geom.x, geom.y) 
+            (geom.centroid.x, geom.centroid.y) if geom.geom_type in ['Polygon', 'MultiPolygon']
+            else (geom.x, geom.y)
             for geom in self.parcels_gdf.geometry
         ])
-        nn_distances, nn_indices = tree.query(parcel_coords)
         
-        for i, (parcel_idx, parcel) in enumerate(self.parcels_gdf.iterrows()):
-            parcel_to_node_distance = nn_distances[i]
-            nearest_node = tuple(network_nodes_array[nn_indices[i]])
-            
-            if nearest_node in self.distances_dict:
-                node_to_park_distance = self.distances_dict[nearest_node]
-                total_distance = parcel_to_node_distance + node_to_park_distance
-            else:
-                node_to_park_distance = float('inf')
-                total_distance = float('inf')
-            
-            self.parcels_gdf.loc[parcel_idx, 'parcel_to_node_distance'] = parcel_to_node_distance
-            self.parcels_gdf.loc[parcel_idx, 'node_to_park_distance'] = node_to_park_distance
-            self.parcels_gdf.loc[parcel_idx, 'park_distance'] = total_distance
+        # Find nearest network node for ALL parcels at once (vectorized KD-tree query)
+        _, nearest_indices = tree.query(parcel_coords)
         
-        valid_distances = self.parcels_gdf[self.parcels_gdf['park_distance'] < float('inf')]['park_distance']
-        print(f"Valid distances: min={valid_distances.min():.2f}, "
-              f"max={valid_distances.max():.2f}, mean={valid_distances.mean():.2f}")
-        print(f"Parcels with valid distances: {len(valid_distances)}/{len(self.parcels_gdf)}")
+        # Look up distances for all parcels (vectorized)
+        parcel_distances = np.array([
+            self.distances_dict.get(tuple(nodes_array[idx]), float('inf'))
+            for idx in nearest_indices
+        ])
+        
+        self.parcels_gdf['park_distance'] = parcel_distances
+        
+        valid_distances = parcel_distances[parcel_distances < float('inf')]
+        if len(valid_distances) > 0:
+            print(f"Valid distances: min={valid_distances.min():.2f}, max={valid_distances.max():.2f}, mean={valid_distances.mean():.2f}")
+        print(f"Parcels with valid distances: {len(valid_distances)}/{len(parcel_distances)}")
     
     def create_visualizations(self):
-        """Create both point map and smoothed heatmap visualizations."""
+        """Create all visualization outputs."""
         output_dir = Path(self.config['output_dir'])
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        base_filename = output_dir / f"{self.city_name.lower().replace(' ', '_')}_parkximity"
+        base_filename = output_dir / f'{self.city_name.lower().replace(" ", "_")}_parkximity'
         
-        # Create entrance map first
-        self._create_entrance_map(output_dir)
+        # Create entrance map
+        self._create_entrance_map(base_filename)
         
-        # Create diagnostic map for parks without entrances
-        if hasattr(self, 'parks_without_entrances'):
-            self._create_parks_without_entrances_map(output_dir, self.parks_without_entrances)
+        # Create parks-without-entrances diagnostic map
+        self._create_parks_without_entrances_map(base_filename)
         
-        # Then create analysis maps
+        # Create point map
         self._create_point_map(base_filename)
+        
+        # Create heatmap
         self._create_heatmap(base_filename)
-        self._create_distance_histogram(base_filename)
+        
+        # Create histogram
+        self._create_histogram(base_filename)
     
-    def _create_entrance_map(self, output_dir):
-        """Create a map showing parks and their generated entrance points."""
+    def _create_entrance_map(self, base_filename):
+        """Create a map showing park entrances."""
         print("Creating park entrance map...")
-        
-        if self.entrances_gdf is None or len(self.entrances_gdf) == 0:
-            print("Warning: No entrances to visualize")
-            return
-        
-        filename = output_dir / f"{self.city_name.lower().replace(' ', '_')}_park_entrances.png"
-        
-        fig, ax = plt.subplots(figsize=(15, 15))
-        
-        # Plot streets as background
-        if self.streets_gdf is not None and len(self.streets_gdf) > 0:
-            self.streets_gdf.plot(ax=ax, color='lightgray', linewidth=0.5, alpha=0.6, zorder=1)
-        
-        # Plot parks
-        self.parks_gdf.plot(ax=ax, color='green', edgecolor='darkgreen', alpha=0.5, linewidth=1, zorder=2)
-        
-        # Plot entrance points
-        self.entrances_gdf.plot(ax=ax, color='red', markersize=30, alpha=0.8, zorder=3, label='Park Entrances')
-        
-        # Plot boundary if available
-        if self.boundary_gdf is not None:
-            self.boundary_gdf.plot(ax=ax, facecolor='none', edgecolor='black', linewidth=2, zorder=4)
-        
-        # Add title and labels
-        ax.set_title(f'Park Entrances Generated for {self.city_name}', fontsize=16, fontweight='bold')
-        ax.set_xlabel('')
-        ax.set_ylabel('')
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_aspect('equal')
-        
-        # Add legend
-        from matplotlib.lines import Line2D
-        legend_elements = [
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='green', 
-                   markersize=10, label=f'Parks ({len(self.parks_gdf)})'),
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='red', 
-                   markersize=10, label=f'Entrances ({len(self.entrances_gdf)})')
-        ]
-        ax.legend(handles=legend_elements, loc='upper right', fontsize=12)
-        
-        # Add info box
-        info_text = (
-            f"Parks: {len(self.parks_gdf)}\n"
-            f"Entrances: {len(self.entrances_gdf)}\n"
-            f"Avg entrances per park: {len(self.entrances_gdf) / len(self.parks_gdf):.1f}"
-        )
-        ax.text(
-            0.02, 0.02,
-            info_text,
-            transform=ax.transAxes,
-            bbox=dict(facecolor='white', alpha=0.8, edgecolor='black'),
-            verticalalignment='bottom',
-            fontsize=10
-        )
-        
-        plt.tight_layout()
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Saved entrance map to {filename}")
-    
-    def _create_parks_without_entrances_map(self, output_dir, parks_without_entrances_list):
-        """Create a diagnostic map showing parks without entrances."""
-        print("Creating diagnostic map for parks without entrances...")
-        
-        if not parks_without_entrances_list or len(parks_without_entrances_list) == 0:
-            print("  All parks have entrances - skipping diagnostic map")
-            return
-        
-        filename = output_dir / f"{self.city_name.lower().replace(' ', '_')}_parks_without_entrances.png"
-        
-        # Create a set of park names without entrances for quick lookup
-        parks_without_set = set(parks_without_entrances_list)
-        
-        # Split parks into two groups
-        parks_with_entrances = []
-        parks_without_entrances_geoms = []
-        
-        for idx, park in self.parks_gdf.iterrows():
-            park_name = park.get('name', park.get('NAME', park.get('park_name', park.get('PARK_NAME', f'Unnamed_Park_{idx}'))))
-            if park_name in parks_without_set:
-                parks_without_entrances_geoms.append(park)
-            else:
-                parks_with_entrances.append(park)
         
         fig, ax = plt.subplots(figsize=(20, 20))
         
-        # Plot streets as background
-        if self.streets_gdf is not None and len(self.streets_gdf) > 0:
-            self.streets_gdf.plot(ax=ax, color='lightgray', linewidth=0.5, alpha=0.6, zorder=1)
-        
-        # Plot parks WITH entrances in green
-        if len(parks_with_entrances) > 0:
-            parks_with_gdf = gpd.GeoDataFrame(parks_with_entrances, crs=self.parks_gdf.crs)
-            parks_with_gdf.plot(ax=ax, color='green', edgecolor='darkgreen', alpha=0.4, linewidth=0.8, zorder=2)
-        
-        # Plot parks WITHOUT entrances in red (highlighted)
-        if len(parks_without_entrances_geoms) > 0:
-            parks_without_gdf = gpd.GeoDataFrame(parks_without_entrances_geoms, crs=self.parks_gdf.crs)
-            parks_without_gdf.plot(ax=ax, color='red', edgecolor='darkred', alpha=0.7, linewidth=1.5, zorder=3)
-        
-        # Plot boundary if available
-        if self.boundary_gdf is not None:
-            self.boundary_gdf.plot(ax=ax, facecolor='none', edgecolor='black', linewidth=2.5, zorder=4)
-        
-        # Add title and labels
-        ax.set_title(
-            f'Diagnostic: Parks Without Entrances - {self.city_name}',
-            fontsize=18,
-            fontweight='bold',
-            pad=20
+        # Plot parks
+        self.parks_gdf.plot(
+            ax=ax,
+            color='lightgreen',
+            edgecolor='darkgreen',
+            alpha=0.5,
+            linewidth=1
         )
-        ax.set_xlabel('')
-        ax.set_ylabel('')
+        
+        # Plot entrances
+        if len(self.entrances_gdf) > 0:
+            self.entrances_gdf.plot(
+                ax=ax,
+                color='red',
+                markersize=10,
+                alpha=0.7,
+                zorder=5
+            )
+        
+        # Plot boundary
+        if self.boundary_gdf is not None:
+            self.boundary_gdf.plot(
+                ax=ax,
+                facecolor='none',
+                edgecolor='black',
+                linewidth=2
+            )
+        
+        ax.set_title(f'Park Entrances - {self.city_name}', fontsize=16, fontweight='bold')
+        ax.set_aspect('equal')
         ax.set_xticks([])
         ax.set_yticks([])
-        ax.set_aspect('equal')
-        
-        # Add legend
-        from matplotlib.patches import Patch
-        legend_elements = [
-            Patch(facecolor='green', edgecolor='darkgreen', alpha=0.4, 
-                  label=f'Parks WITH entrances ({len(parks_with_entrances)})'),
-            Patch(facecolor='red', edgecolor='darkred', alpha=0.7, 
-                  label=f'Parks WITHOUT entrances ({len(parks_without_entrances_geoms)})'),
-            Patch(facecolor='lightgray', alpha=0.6, 
-                  label=f'Street Network')
-        ]
-        ax.legend(handles=legend_elements, loc='upper right', fontsize=14)
-        
-        # Add info box with details
-        info_text = (
-            f"Parks Analysis:\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Total parks: {len(self.parks_gdf)}\n"
-            f"With entrances: {len(parks_with_entrances)}\n"
-            f"Without entrances: {len(parks_without_entrances_geoms)}\n"
-            f"% without access: {100*len(parks_without_entrances_geoms)/len(self.parks_gdf):.1f}%\n"
-            f"\n"
-            f"Possible reasons for no entrances:\n"
-            f"  • Park too small\n"
-            f"  • No streets within buffer ({self.config.get('park_buffer', 50.0)}m)\n"
-            f"  • Disconnected from street network\n"
-            f"  • Interior courtyard/private park"
-        )
-        ax.text(
-            0.02, 0.98,
-            info_text,
-            transform=ax.transAxes,
-            bbox=dict(facecolor='white', alpha=0.9, edgecolor='black', boxstyle='round,pad=0.5'),
-            verticalalignment='top',
-            fontsize=10,
-            family='monospace'
-        )
-        
-        # Sample a few parks without entrances and add their names to map
-        if len(parks_without_entrances_geoms) > 0 and len(parks_without_entrances_geoms) <= 20:
-            print(f"  Labeling {len(parks_without_entrances_geoms)} parks without entrances...")
-            for park in parks_without_entrances_geoms[:20]:  # Limit to 20 labels
-                park_name = park.get('name', park.get('NAME', park.get('park_name', park.get('PARK_NAME', 'Unnamed'))))
-                centroid = park.geometry.centroid
-                ax.annotate(
-                    park_name,
-                    xy=(centroid.x, centroid.y),
-                    fontsize=6,
-                    ha='center',
-                    bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=1)
-                )
         
         plt.tight_layout()
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        entrance_filename = f'{base_filename}_entrances.png'
+        plt.savefig(entrance_filename, dpi=300, bbox_inches='tight')
         plt.close()
-        print(f"Saved parks-without-entrances diagnostic map to {filename}")
-        print(f"  → {len(parks_without_entrances_geoms)} parks highlighted in red")
+        
+        print(f"Saved entrance map to {entrance_filename}")
     
+    def _create_parks_without_entrances_map(self, base_filename):
+        """Create diagnostic map highlighting parks without entrances."""
+        print("Creating diagnostic map for parks without entrances...")
+        
+        fig, ax = plt.subplots(figsize=(20, 20))
+        
+        # Plot all parks in green
+        self.parks_gdf.plot(
+            ax=ax,
+            color='lightgreen',
+            edgecolor='darkgreen',
+            alpha=0.5,
+            linewidth=1,
+            zorder=1
+        )
+        
+        # Highlight parks without entrances in red
+        if hasattr(self, 'parks_without_entrances') and len(self.parks_without_entrances) > 0:
+            # Find parks by name that don't have entrances
+            parks_no_entrance = self.parks_gdf[
+                self.parks_gdf.apply(
+                    lambda row: row.get('name', row.get('NAME', row.get('park_name', row.get('PARK_NAME', f'Unnamed_Park_{row.name}')))) 
+                    in self.parks_without_entrances,
+                    axis=1
+                )
+            ]
+            
+            if len(parks_no_entrance) > 0:
+                parks_no_entrance.plot(
+                    ax=ax,
+                    color='red',
+                    edgecolor='darkred',
+                    alpha=0.7,
+                    linewidth=2,
+                    zorder=2
+                )
+        
+        # Plot boundary
+        if self.boundary_gdf is not None:
+            self.boundary_gdf.plot(
+                ax=ax,
+                facecolor='none',
+                edgecolor='black',
+                linewidth=2,
+                zorder=3
+            )
+        
+        ax.set_title(f'Parks Without Entrances (Red) - {self.city_name}', fontsize=16, fontweight='bold')
+        ax.set_aspect('equal')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        
+        plt.tight_layout()
+        diagnostic_filename = f'{base_filename}_parks_without_entrances.png'
+        plt.savefig(diagnostic_filename, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        parks_without = len(self.parks_without_entrances) if hasattr(self, 'parks_without_entrances') else 0
+        print(f"Saved parks-without-entrances diagnostic map to {diagnostic_filename}")
+        print(f"  → {parks_without} parks highlighted in red")
     
     def _create_point_map(self, base_filename):
-        """Create point-based visualization."""
+        """Create a point map of parcel distances."""
         print("Creating point map visualization...")
         
+        if len(self.parcels_gdf) == 0:
+            print("Warning: No parcels for point map.")
+            return
+        
+        fig, ax = plt.subplots(figsize=(20, 20))
+        
+        # Filter to valid distances
         valid_parcels = self.parcels_gdf[self.parcels_gdf['park_distance'] < float('inf')].copy()
         
         if len(valid_parcels) == 0:
-            print("Warning: No valid distances for visualization.")
+            print("Warning: No valid distances for point map.")
             return
         
-        valid_parcels['park_distance_km'] = valid_parcels['park_distance'] / 1000.0
-        vmin_km = valid_parcels['park_distance_km'].min()
-        vmax_km = np.percentile(valid_parcels['park_distance_km'], 95)
+        # Convert to km for display
+        valid_parcels['distance_km'] = valid_parcels['park_distance'] / 1000.0
         
-        fig, ax = plt.subplots(figsize=(15, 15))
-        
-        # Streets
-        self.streets_gdf.plot(ax=ax, color='gray', linewidth=0.4, alpha=0.5)
-        
-        # Get coordinates - handle both Point and Polygon geometries
-        x_coords = []
-        y_coords = []
-        for geom in valid_parcels.geometry:
-            if geom.geom_type in ['Polygon', 'MultiPolygon']:
-                centroid = geom.centroid
-                x_coords.append(centroid.x)
-                y_coords.append(centroid.y)
-            else:  # Point
-                x_coords.append(geom.x)
-                y_coords.append(geom.y)
-        
-        # Parcel points
-        scatter = ax.scatter(
-            x_coords,
-            y_coords,
-            c=valid_parcels['park_distance_km'],
-            cmap='viridis_r',
-            norm=clrs.Normalize(vmin=vmin_km, vmax=vmax_km),
-            alpha=0.6,
-            s=20,
-            edgecolor=None,
-            zorder=2
+        # Plot parcels colored by distance
+        valid_parcels.plot(
+            ax=ax,
+            column='distance_km',
+            cmap='RdYlGn_r',
+            markersize=1,
+            alpha=0.7,
+            legend=True,
+            legend_kwds={'label': 'Distance to Park (km)', 'shrink': 0.5}
         )
         
-        # Parks
-        self.parks_gdf.plot(ax=ax, color='blue', edgecolor='darkblue', alpha=0.7, zorder=3)
-        
-        # Boundary
+        # Plot boundary
         if self.boundary_gdf is not None:
-            self.boundary_gdf.plot(ax=ax, facecolor='none', edgecolor='black', linewidth=1.5, zorder=4)
+            self.boundary_gdf.plot(
+                ax=ax,
+                facecolor='none',
+                edgecolor='black',
+                linewidth=2
+            )
         
-        cbar = fig.colorbar(scatter, ax=ax, extend='max', shrink=0.7)
-        cbar.set_label('Distance to high-quality parks (kilometers, weighted by LTS)')
-        
-        ax.set_title(f'Accessibility to High-Quality Parks in {self.city_name}', fontsize=16)
-        ax.set_xlabel('')
-        ax.set_ylabel('')
+        ax.set_title(f'Park Accessibility by Parcel - {self.city_name}', fontsize=16, fontweight='bold')
+        ax.set_aspect('equal')
         ax.set_xticks([])
         ax.set_yticks([])
-        ax.set_aspect('equal')
-        
-        ax.text(
-            0.02, 0.02,
-            f"Analysis of {len(valid_parcels)} parcels\nto {len(self.parks_gdf)} high-quality parks",
-            transform=ax.transAxes,
-            bbox=dict(facecolor='white', alpha=0.7)
-        )
         
         plt.tight_layout()
-        plt.savefig(f'{base_filename}_pointmap.png', dpi=300, bbox_inches='tight')
+        pointmap_filename = f'{base_filename}_pointmap.png'
+        plt.savefig(pointmap_filename, dpi=300, bbox_inches='tight')
         plt.close()
-        print(f"Saved point map to {base_filename}_pointmap.png")
+        
+        print(f"Saved point map to {pointmap_filename}")
     
     def _create_heatmap(self, base_filename):
         """Create smoothed heatmap visualization."""
@@ -1449,8 +1464,8 @@ class ParkProximityAnalyzer:
         plt.close()
         print(f"Saved heatmap to {base_filename}_heatmap.png")
     
-    def _create_distance_histogram(self, base_filename):
-        """Create histogram of weighted distances from parcels to nearest park."""
+    def _create_histogram(self, base_filename):
+        """Create a histogram of park distances."""
         print("Creating distance histogram...")
         
         valid_parcels = self.parcels_gdf[self.parcels_gdf['park_distance'] < float('inf')].copy()
@@ -1577,58 +1592,80 @@ def run_multi_city_analysis(cities_config):
 # Example usage
 if __name__ == "__main__":
     # Multi-city configuration dictionary
+    # Note: source_crs and target_crs are no longer needed!
+    # All data is automatically reprojected to EPSG:6350 (NAD83(2011) / Conus Albers)
     cities_config = {
-        'Boston': {
-            'parcels_path': 'Data/Raw/Boston/Parcels__2024_.geojson',
-            'parks_path': 'Data/Raw/Boston/boston_parks.geojson',  # Corrected path for polygon parks
-            'streets_path': 'Data/Processed/lts_bos.geojson',
-            'boundary_path': 'Data/Raw/Boston/boston_neighborhood_boundaries.geojson.json',
-            'source_crs': 'EPSG:4326',
-            'target_crs': 'EPSG:2227',
-            'output_dir': 'Visualizations',
-            'lts_column': 'PC2_norm',
-            'boundary_county_column': 'name',
-            'combine_boundaries': True,
-            'park_buffer': 50.0,
-            'entrance_tolerance': 5.0,
-            'heatmap_resolution': 100,
-            'heatmap_neighbors': 5,
-            'heatmap_smoothing': 1
-        },
-        # 'LA': {
-        #     'parcels_path': 'Data/Raw/LA/LA_clipped_parcels.geojson',
-        #     'parks_path': 'Data/Raw/LA/la_parks.geojson',  # Corrected path for polygon parks
-        #     'streets_path': 'Data/Processed/lts_la.geojson',
-        #     'boundary_path': 'Data/Raw/LA/City_Boundary.geojson',
-        #     'source_crs': 'EPSG:2229',
-        #     'target_crs': 'EPSG:4326',
-        #     'output_dir': 'Visualizations',
+        # 'Boston': {
+        #     'parcels_path': 'Data/Raw/Boston/Parcels__2024_.geojson',
+        #     'parks_path': 'Data/Raw/Boston/boston_parks.geojson',
+        #     'streets_path': 'Data/Processed/lts_bos.geojson',
+        #     'boundary_path': 'Data/Raw/Boston/boston_neighborhood_boundaries.geojson.json',
+        #     'output_dir': 'Visualizations/Boston',
         #     'lts_column': 'PC2_norm',
-        #     # 'boundary_county_column': 'name',
-        #     'combine_boundaries': False,
-        #     'park_buffer': 50.0,
-        #     'entrance_tolerance': 5.0,
+        #     'boundary_county_column': 'name',
+        #     'combine_boundaries': True,
+        #     'park_buffer': 50.0,           # meters
+        #     'entrance_tolerance': 5.0,      # meters
         #     'heatmap_resolution': 100,
         #     'heatmap_neighbors': 5,
         #     'heatmap_smoothing': 1
-        #     }
-        'Houston': {
-            'parcels_path': 'Data/Raw/Houston/houstonparcelsclipped.geojson',
-            'parks_path': 'Data/Raw/Houston/COH_PARKS_(City_of_Houston).geojson',  # Corrected path for polygon parks
-            'streets_path': 'Data/Processed/lts_hou.geojson',
-            'boundary_path': 'Data/Raw/Houston/houstoncitylimits.geojson',
-            'source_crs': 'EPSG:4326',
-            'target_crs': 'EPSG:32615',
-            'output_dir': 'Visualizations',
-            'lts_column': 'PC2_norm',
-            # 'boundary_county_column': 'name',
+        # },
+        # 'Houston': {
+        #     'parcels_path': 'Data/Raw/Houston/houstonparcelsclipped.geojson',
+        #     'parks_path': 'Data/Raw/Houston/COH_PARKS_(City_of_Houston).geojson',
+        #     'streets_path': 'Data/Processed/lts_hou.geojson',
+        #     'boundary_path': 'Data/Raw/Houston/houstoncitylimits.geojson',
+        #     'output_dir': 'Visualizations/Houston',
+        #     'lts_column': 'PC2_norm',
+        #     'combine_boundaries': False,
+        #     'park_buffer': 50.0,           # meters
+        #     'entrance_tolerance': 5.0,      # meters
+        #     'heatmap_resolution': 100,
+        #     'heatmap_neighbors': 5,
+        #     'heatmap_smoothing': 1
+        # },
+        # 'NYC': {
+        #     'parcels_path': 'Data/Raw/NYC/NYC_clipped_parcels.geojson',
+        #     'parks_path': 'Data/Raw/NYC/Parks_Properties_20251120.geojson',
+        #     'streets_path': 'Data/Processed/lts_nyc.geojson',
+        #     'boundary_path': 'Data/Raw/NYC/NY_County_FeaturesToJSON.geojson',
+        #     'output_dir': 'Visualizations/NYC',
+        #     'lts_column': 'PC2_norm',
+        #     'combine_boundaries': False,
+        #     'park_buffer': 50.0,           # meters
+        #     'entrance_tolerance': 5.0,      # meters
+        #     'heatmap_resolution': 100,
+        #     'heatmap_neighbors': 5,
+        #     'heatmap_smoothing': 1
+        # },
+        # 'LA': {
+        #     'parcels_path': 'Data/Raw/LA/LA_clipped_parcels.geojson',
+        #     'parks_path': 'Data/Raw/LA/la_parks.geojson',
+        #     'streets_path': 'Data/Processed/lts_la.geojson',
+        #     'boundary_path': 'Data/Raw/LA/City_Boundary.geojson',
+        #     'output_dir': 'Visualizations/LA',
+        #     'lts_column': 'PC2_norm',
+        #     'combine_boundaries': False,
+        #     'park_buffer': 50.0,           # meters
+        #     'entrance_tolerance': 5.0,      # meters
+        #     'heatmap_resolution': 100,
+        #     'heatmap_neighbors': 5,
+        #     'heatmap_smoothing': 1
+        # },
+        'SF': {
+            'parcels_path': 'Data/Raw/SF/Parcels_–_Active_and_Retired_20251208.geojson',
+            'parks_path': 'Data/Raw/SF/Recreation_and_Parks_Properties_20251208.geojson',
+            'streets_path': 'Data/Processed/lts_sf.geojson',
+            'boundary_path': 'Data/Raw/SF/SF_Boundary.geojson',
+            'output_dir': 'Visualizations/SF',
+            'lts_column': 'PC1',
             'combine_boundaries': False,
-            'park_buffer': 50.0,
-            'entrance_tolerance': 5.0,
+            'park_buffer': 50.0,           # meters
+            'entrance_tolerance': 5.0,      # meters
             'heatmap_resolution': 100,
             'heatmap_neighbors': 5,
             'heatmap_smoothing': 1
-            }
+        }
     }
     
     # Run analysis for all cities

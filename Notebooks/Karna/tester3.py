@@ -8,9 +8,11 @@ from scipy.spatial import cKDTree
 from scipy.ndimage import gaussian_filter
 from shapely.geometry import Point, LineString, MultiPolygon
 from shapely import wkt
+from shapely.strtree import STRtree
 from pyproj import Transformer
 import heapq
 from pathlib import Path
+import pickle
 
 
 class ParkProximityAnalyzer:
@@ -167,7 +169,7 @@ class ParkProximityAnalyzer:
         self._create_diagnostic_map()
         
         # Load park entrances (generate from street-park intersections)
-        self._generate_entrances()
+        self._generate_entrances_optimized()
     
     def _create_diagnostic_map(self):
         """Create a map showing streets and parks before entrance generation."""
@@ -449,247 +451,299 @@ class ParkProximityAnalyzer:
             print("  - Boundary polygon correctly represents the city area")
             print("  - Parcel coordinates are correct")
     
-    def _generate_entrances(self):
+    def _generate_entrances_optimized(self):
         """
-        Assign park entrances as points where the street network intersects 
-        with park polygons. Only handles polygon parks.
+        OPTIMIZED: Generate park entrances with batching, vectorization, and checkpointing.
+        Memory-efficient version that processes parks in batches and saves progress to disk.
         """
-        print("Generating park entrances from street-park intersections...")
+        print("Generating park entrances (OPTIMIZED VERSION)...")
         
-        # Verify we have parks and streets to work with
-        if len(self.parks_gdf) == 0:
-            print("ERROR: No parks available for entrance generation!")
-            self.entrances_gdf = gpd.GeoDataFrame(geometry=[], crs=self.config['target_crs'])
-            return
-        
-        if len(self.streets_gdf) == 0:
-            print("ERROR: No streets available for entrance generation!")
+        # Verify we have parks and streets
+        if len(self.parks_gdf) == 0 or len(self.streets_gdf) == 0:
+            print("ERROR: No parks or streets available!")
             self.entrances_gdf = gpd.GeoDataFrame(geometry=[], crs=self.config['target_crs'])
             return
         
         # Verify CRS match
         if self.parks_gdf.crs != self.streets_gdf.crs:
-            print(f"WARNING: CRS mismatch detected!")
-            print(f"  Parks CRS: {self.parks_gdf.crs}")
-            print(f"  Streets CRS: {self.streets_gdf.crs}")
-            print(f"  Converting parks to streets CRS...")
+            print(f"Converting parks to streets CRS...")
             self.parks_gdf = self.parks_gdf.to_crs(self.streets_gdf.crs)
         
-        # Get buffer distance from config (default 50 meters)
+        # Configuration
         buffer_distance = self.config.get('park_buffer', 50.0)
-        print(f"Using buffer distance: {buffer_distance} meters")
-        print(f"Processing {len(self.parks_gdf)} polygon parks")
+        entrance_tolerance = self.config.get('entrance_tolerance', 5.0)
+        batch_size = self.config.get('entrance_batch_size', 50)  # Process 50 parks at a time
         
-        entrance_points = []
-        entrance_data = []
-        parks_with_entrances = 0
+        print(f"Config: buffer={buffer_distance}m, tolerance={entrance_tolerance}m, batch_size={batch_size}")
+        
+        # Setup checkpoint directory
+        checkpoint_dir = Path(self.config.get('output_dir', 'Visualizations')) / 'checkpoints'
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_file = checkpoint_dir / f"{self.city_name.lower().replace(' ', '_')}_entrances_checkpoint.pkl"
+        
+        # Check for existing checkpoint
+        if checkpoint_file.exists():
+            print(f"Found checkpoint file, loading previous progress...")
+            with open(checkpoint_file, 'rb') as f:
+                checkpoint_data = pickle.load(f)
+                all_entrance_coords = checkpoint_data['coords']
+                all_entrance_data = checkpoint_data['data']
+                start_idx = checkpoint_data['last_processed'] + 1
+            print(f"Resuming from park {start_idx}/{len(self.parks_gdf)}")
+        else:
+            all_entrance_coords = []
+            all_entrance_data = []
+            start_idx = 0
+        
+        # Create spatial index for streets (once)
+        print("Building spatial index for streets...")
+        streets_tree = STRtree(self.streets_gdf.geometry)
+        
+        # Process parks in batches
+        total_parks = len(self.parks_gdf)
         parks_without_entrances = []
         
-        for park_idx, park in self.parks_gdf.iterrows():
+        for batch_start in range(start_idx, total_parks, batch_size):
+            batch_end = min(batch_start + batch_size, total_parks)
+            batch_parks = self.parks_gdf.iloc[batch_start:batch_end]
+            
+            print(f"\nProcessing batch {batch_start}-{batch_end}/{total_parks} "
+                f"({100*batch_end//total_parks}%) - {len(all_entrance_coords)} entrances so far")
+            
+            # Process this batch
+            batch_coords, batch_data, batch_no_access = self._process_park_batch(
+                batch_parks, streets_tree, buffer_distance, entrance_tolerance
+            )
+            
+            # Append to running totals
+            all_entrance_coords.extend(batch_coords)
+            all_entrance_data.extend(batch_data)
+            parks_without_entrances.extend(batch_no_access)
+            
+            # Save checkpoint every batch
+            checkpoint_data = {
+                'coords': all_entrance_coords,
+                'data': all_entrance_data,
+                'last_processed': batch_end - 1,
+                'parks_without_entrances': parks_without_entrances
+            }
+            with open(checkpoint_file, 'wb') as f:
+                pickle.dump(checkpoint_data, f)
+        
+        print(f"\n✓ Processed all {total_parks} parks")
+        print(f"  Total entrance candidates: {len(all_entrance_coords)}")
+        
+        # VECTORIZED GLOBAL DEDUPLICATION
+        print("\nPerforming global deduplication (vectorized)...")
+        unique_coords, unique_data = self._vectorized_deduplication(
+            all_entrance_coords, all_entrance_data, entrance_tolerance
+        )
+        
+        # Create GeoDataFrame
+        if len(unique_coords) == 0:
+            print("ERROR: No entrances generated!")
+            self.entrances_gdf = gpd.GeoDataFrame(geometry=[], crs=self.config['target_crs'])
+        else:
+            unique_points = [Point(x, y) for x, y in unique_coords]
+            self.entrances_gdf = gpd.GeoDataFrame(
+                unique_data,
+                geometry=unique_points,
+                crs=self.config['target_crs']
+            )
+            
+            removed = len(all_entrance_coords) - len(unique_coords)
+            print(f"✓ Generated {len(self.entrances_gdf)} unique entrances")
+            print(f"  Removed {removed} duplicates ({100*removed/len(all_entrance_coords):.1f}%)")
+        
+        # Store parks without entrances
+        self.parks_without_entrances = parks_without_entrances
+        
+        # Clean up checkpoint
+        if checkpoint_file.exists():
+            checkpoint_file.unlink()
+            print(f"✓ Cleaned up checkpoint file")
+
+
+    def _process_park_batch(self, batch_parks, streets_tree, buffer_distance, entrance_tolerance):
+        """
+        Process a batch of parks to generate entrance points.
+        Uses vectorized operations within each park for speed.
+        
+        Returns:
+        --------
+        tuple: (coordinates, data, parks_without_access)
+        """
+        batch_coords = []
+        batch_data = []
+        parks_no_access = []
+        
+        for park_idx, park in batch_parks.iterrows():
             park_geom = park.geometry
-            # Better park name handling
-            park_name = park.get('name', park.get('NAME', park.get('park_name', park.get('PARK_NAME', f'Unnamed_Park_{park_idx}'))))
+            park_name = park.get('name', park.get('NAME', park.get('park_name', 
+                                park.get('PARK_NAME', f'Unnamed_Park_{park_idx}'))))
             
-            # Buffer park to find intersecting streets
+            # Buffer and find intersecting streets
             buffered_park = park_geom.buffer(buffer_distance)
+            potential_indices = streets_tree.query(buffered_park)
             
-            # Find all streets that intersect with the buffered park
-            intersecting_streets = self.streets_gdf[self.streets_gdf.intersects(buffered_park)]
-            
-            if len(intersecting_streets) == 0:
-                parks_without_entrances.append(park_name)
+            if len(potential_indices) == 0:
+                parks_no_access.append(park_name)
                 continue
             
-            parks_with_entrances += 1
-            park_entrance_count = 0
+            intersecting_streets = self.streets_gdf.iloc[potential_indices]
+            intersecting_streets = intersecting_streets[intersecting_streets.intersects(buffered_park)]
+            
+            if len(intersecting_streets) == 0:
+                parks_no_access.append(park_name)
+                continue
+            
+            # Collect all intersection points for this park
+            park_points = []
             
             for street_idx, street in intersecting_streets.iterrows():
-                # Get the intersection with the ORIGINAL park boundary (not buffered)
-                intersection = street.geometry.intersection(park_geom)
-                
-                # If no direct intersection, use the closest point on park boundary
-                if intersection.is_empty:
-                    try:
-                        nearest_point = park_geom.boundary.interpolate(
-                            park_geom.boundary.project(street.geometry.centroid)
-                        )
-                        if nearest_point is not None and not nearest_point.is_empty:
-                            entrance_points.append(nearest_point)
-                            entrance_data.append({
-                                'park_name': park_name,
-                                'park_id': park_idx,
-                                'street_id': street_idx,
-                                'method': 'nearest_point'
-                            })
-                            park_entrance_count += 1
-                    except Exception as e:
-                        continue
+                try:
+                    intersection = street.geometry.intersection(park_geom.boundary)
+                except Exception:
                     continue
                 
-                # Handle different geometry types
-                if intersection.geom_type == 'Point':
-                    entrance_points.append(intersection)
-                    entrance_data.append({
-                        'park_name': park_name,
-                        'park_id': park_idx,
-                        'street_id': street_idx,
-                        'method': 'direct_intersection'
-                    })
-                    park_entrance_count += 1
-                elif intersection.geom_type == 'MultiPoint':
-                    for point in intersection.geoms:
-                        entrance_points.append(point)
-                        entrance_data.append({
+                if intersection.is_empty:
+                    continue
+                
+                # Extract points based on geometry type
+                points = self._extract_points_from_intersection(intersection)
+                
+                for pt in points:
+                    if pt is not None and not pt.is_empty:
+                        park_points.append({
+                            'coord': (pt.x, pt.y),
                             'park_name': park_name,
                             'park_id': park_idx,
                             'street_id': street_idx,
-                            'method': 'direct_intersection'
+                            'method': 'boundary_intersection'
                         })
-                        park_entrance_count += 1
-                elif intersection.geom_type == 'LineString':
-                    coords = list(intersection.coords)
+            
+            # Vectorized deduplication within this park
+            if len(park_points) > 0:
+                unique_park_points = self._deduplicate_park_points_vectorized(
+                    park_points, entrance_tolerance
+                )
+                
+                for pt_data in unique_park_points:
+                    batch_coords.append(pt_data['coord'])
+                    batch_data.append({
+                        'park_name': pt_data['park_name'],
+                        'park_id': pt_data['park_id'],
+                        'street_id': pt_data['street_id'],
+                        'method': pt_data['method']
+                    })
+            else:
+                # Fallback: nearest point on boundary
+                try:
+                    nearest_street = intersecting_streets.iloc[0]
+                    nearest_point = park_geom.boundary.interpolate(
+                        park_geom.boundary.project(nearest_street.geometry.centroid)
+                    )
+                    if nearest_point is not None and not nearest_point.is_empty:
+                        batch_coords.append((nearest_point.x, nearest_point.y))
+                        batch_data.append({
+                            'park_name': park_name,
+                            'park_id': park_idx,
+                            'street_id': nearest_street.name,
+                            'method': 'nearest_point_fallback'
+                        })
+                except Exception:
+                    parks_no_access.append(park_name)
+        
+        return batch_coords, batch_data, parks_no_access
+
+
+    def _extract_points_from_intersection(self, intersection):
+        """Extract point coordinates from various geometry types."""
+        points = []
+        
+        geom_type = intersection.geom_type
+        
+        if geom_type == 'Point':
+            points.append(intersection)
+        elif geom_type == 'MultiPoint':
+            points.extend(list(intersection.geoms))
+        elif geom_type == 'LineString':
+            coords = list(intersection.coords)
+            if len(coords) >= 2:
+                points.extend([Point(coords[0]), Point(coords[-1])])
+        elif geom_type == 'MultiLineString':
+            for line in intersection.geoms:
+                coords = list(line.coords)
+                if len(coords) >= 2:
+                    points.extend([Point(coords[0]), Point(coords[-1])])
+        elif geom_type == 'GeometryCollection':
+            for geom in intersection.geoms:
+                if geom.geom_type == 'Point':
+                    points.append(geom)
+                elif geom.geom_type == 'LineString':
+                    coords = list(geom.coords)
                     if len(coords) >= 2:
-                        entrance_points.append(Point(coords[0]))
-                        entrance_points.append(Point(coords[-1]))
-                        entrance_data.extend([
-                            {
-                                'park_name': park_name,
-                                'park_id': park_idx,
-                                'street_id': street_idx,
-                                'method': 'line_endpoints'
-                            },
-                            {
-                                'park_name': park_name,
-                                'park_id': park_idx,
-                                'street_id': street_idx,
-                                'method': 'line_endpoints'
-                            }
-                        ])
-                        park_entrance_count += 2
-                elif intersection.geom_type == 'MultiLineString':
-                    for line in intersection.geoms:
-                        coords = list(line.coords)
-                        if len(coords) >= 2:
-                            entrance_points.append(Point(coords[0]))
-                            entrance_points.append(Point(coords[-1]))
-                            entrance_data.extend([
-                                {
-                                    'park_name': park_name,
-                                    'park_id': park_idx,
-                                    'street_id': street_idx,
-                                    'method': 'line_endpoints'
-                                },
-                                {
-                                    'park_name': park_name,
-                                    'park_id': park_idx,
-                                    'street_id': street_idx,
-                                    'method': 'line_endpoints'
-                                }
-                            ])
-                            park_entrance_count += 2
-                elif intersection.geom_type in ['Polygon', 'MultiPolygon', 'GeometryCollection']:
-                    boundary = intersection.boundary
-                    if boundary.geom_type == 'LineString':
-                        coords = list(boundary.coords)
-                        if len(coords) > 0:
-                            entrance_points.append(Point(coords[0]))
-                            entrance_data.append({
-                                'park_name': park_name,
-                                'park_id': park_idx,
-                                'street_id': street_idx,
-                                'method': 'polygon_boundary'
-                            })
-                            park_entrance_count += 1
-                    elif boundary.geom_type == 'MultiLineString':
-                        for line in boundary.geoms:
-                            coords = list(line.coords)
-                            if len(coords) > 0:
-                                entrance_points.append(Point(coords[0]))
-                                entrance_data.append({
-                                    'park_name': park_name,
-                                    'park_id': park_idx,
-                                    'street_id': street_idx,
-                                    'method': 'polygon_boundary'
-                                })
-                                park_entrance_count += 1
-            
-            if park_entrance_count > 0 and parks_with_entrances <= 5:
-                print(f"  Park '{park_name}': {park_entrance_count} entrances")
+                        points.extend([Point(coords[0]), Point(coords[-1])])
         
-        print(f"Parks with entrances: {parks_with_entrances}/{len(self.parks_gdf)}")
+        return points
+
+
+    def _deduplicate_park_points_vectorized(self, park_points, tolerance):
+        """
+        Vectorized deduplication of points within a single park.
+        Much faster than nested loops for large point sets.
+        """
+        if len(park_points) <= 1:
+            return park_points
         
-        if len(parks_without_entrances) > 0:
-            print(f"Parks without entrances: {len(parks_without_entrances)}")
-            print(f"  Possible reasons: too small, no streets nearby, or disconnected from network")
-            if len(parks_without_entrances) <= 5:
-                print(f"  Examples: {', '.join(parks_without_entrances[:5])}")
+        # Convert to numpy array for vectorized operations
+        coords_array = np.array([pt['coord'] for pt in park_points])
         
-        # Store parks without entrances for diagnostic mapping
-        self.parks_without_entrances = parks_without_entrances
+        # Build KDTree for efficient spatial queries
+        tree = cKDTree(coords_array)
         
-        if len(entrance_points) == 0:
-            print("ERROR: No street-park intersections found!")
-            print("This could mean:")
-            print("  - Parks and streets are in different coordinate systems")
-            print("  - Park polygons don't overlap with street network")
-            print("  - Parks are too small or streets don't reach them")
-            print("  - Data quality issues with park or street geometries")
-            print("\nDebugging info:")
-            print(f"  Number of parks: {len(self.parks_gdf)}")
-            print(f"  Number of streets: {len(self.streets_gdf)}")
-            print(f"  Parks CRS: {self.parks_gdf.crs}")
-            print(f"  Streets CRS: {self.streets_gdf.crs}")
-            print(f"  Parks bounds: {self.parks_gdf.total_bounds}")
-            print(f"  Streets bounds: {self.streets_gdf.total_bounds}")
-            
-            # Sample a few parks and check their geometries
-            print("\nSample park analysis:")
-            for i, (idx, park) in enumerate(self.parks_gdf.head(3).iterrows()):
-                park_name = park.get('name', park.get('NAME', f'Park_{idx}'))
-                print(f"  Park: {park_name}")
-                print(f"    Type: {park.geometry.geom_type}")
-                print(f"    Area: {park.geometry.area:.2f}")
-                print(f"    Bounds: {park.geometry.bounds}")
-                
-                # Check if any streets are nearby
-                buffered = park.geometry.buffer(50)  # 50 meter buffer
-                nearby = self.streets_gdf[self.streets_gdf.intersects(buffered)]
-                print(f"    Streets within 50m: {len(nearby)}")
-            
-            # Create empty GeoDataFrame
-            self.entrances_gdf = gpd.GeoDataFrame(
-                geometry=[],
-                crs=self.config['target_crs']
-            )
-            return
+        # Find all pairs within tolerance
+        pairs = tree.query_pairs(r=tolerance)
         
-        # Remove duplicate points (within a small tolerance)
-        unique_points = []
-        unique_data = []
-        tolerance = self.config.get('entrance_tolerance', 1.0)  # 1 meter default
+        # Create set of indices to remove (keep first occurrence)
+        indices_to_remove = set()
+        for i, j in pairs:
+            if i not in indices_to_remove:
+                indices_to_remove.add(j)
         
-        for i, point in enumerate(entrance_points):
-            # Skip None points
-            if point is None or point.is_empty:
-                continue
-                
-            is_duplicate = False
-            for existing_point in unique_points:
-                if existing_point is not None and point.distance(existing_point) < tolerance:
-                    is_duplicate = True
-                    break
-            if not is_duplicate:
-                unique_points.append(point)
-                unique_data.append(entrance_data[i])
+        # Keep only unique points
+        unique_points = [pt for i, pt in enumerate(park_points) if i not in indices_to_remove]
         
-        self.entrances_gdf = gpd.GeoDataFrame(
-            unique_data,
-            geometry=unique_points,
-            crs=self.config['target_crs']
-        )
+        return unique_points
+
+
+    def _vectorized_deduplication(self, coords_list, data_list, tolerance):
+        """
+        Vectorized global deduplication across all entrances.
+        Uses spatial indexing for O(n log n) performance instead of O(n²).
+        """
+        if len(coords_list) == 0:
+            return [], []
         
-        print(f"Generated {len(self.entrances_gdf)} unique park entrance points")
-        print(f"  (Removed {len(entrance_points) - len(unique_points)} duplicate points within {tolerance}m)")
+        print(f"  Building spatial index for {len(coords_list)} points...")
+        coords_array = np.array(coords_list)
+        tree = cKDTree(coords_array)
+        
+        print(f"  Finding duplicates within {tolerance}m...")
+        pairs = tree.query_pairs(r=tolerance)
+        
+        print(f"  Found {len(pairs)} duplicate pairs, filtering...")
+        # Use set for O(1) lookup
+        indices_to_remove = set()
+        for i, j in pairs:
+            if i not in indices_to_remove:
+                indices_to_remove.add(j)
+        
+        # Filter in one pass
+        unique_coords = [coords_list[i] for i in range(len(coords_list)) if i not in indices_to_remove]
+        unique_data = [data_list[i] for i in range(len(data_list)) if i not in indices_to_remove]
+        
+        return unique_coords, unique_data
     
     def _load_boundary(self):
         """Load city/county boundary from GeoJSON or CSV file."""
@@ -1578,23 +1632,23 @@ def run_multi_city_analysis(cities_config):
 if __name__ == "__main__":
     # Multi-city configuration dictionary
     cities_config = {
-        'Boston': {
-            'parcels_path': 'Data/Raw/Boston/Parcels__2024_.geojson',
-            'parks_path': 'Data/Raw/Boston/boston_parks.geojson',  # Corrected path for polygon parks
-            'streets_path': 'Data/Processed/lts_bos.geojson',
-            'boundary_path': 'Data/Raw/Boston/boston_neighborhood_boundaries.geojson.json',
-            'source_crs': 'EPSG:4326',
-            'target_crs': 'EPSG:2227',
-            'output_dir': 'Visualizations',
-            'lts_column': 'PC2_norm',
-            'boundary_county_column': 'name',
-            'combine_boundaries': True,
-            'park_buffer': 50.0,
-            'entrance_tolerance': 5.0,
-            'heatmap_resolution': 100,
-            'heatmap_neighbors': 5,
-            'heatmap_smoothing': 1
-        },
+        # 'Boston': {
+        #     'parcels_path': 'Data/Raw/Boston/Parcels__2024_.geojson',
+        #     'parks_path': 'Data/Raw/Boston/boston_parks.geojson',  # Corrected path for polygon parks
+        #     'streets_path': 'Data/Processed/lts_bos.geojson',
+        #     'boundary_path': 'Data/Raw/Boston/boston_neighborhood_boundaries.geojson.json',
+        #     'source_crs': 'EPSG:4326',
+        #     'target_crs': 'EPSG:2227',
+        #     'output_dir': 'Visualizations',
+        #     'lts_column': 'PC2_norm',
+        #     'boundary_county_column': 'name',
+        #     'combine_boundaries': True,
+        #     'park_buffer': 50.0,
+        #     'entrance_tolerance': 5.0,
+        #     'heatmap_resolution': 100,
+        #     'heatmap_neighbors': 5,
+        #     'heatmap_smoothing': 1
+        # },
         # 'LA': {
         #     'parcels_path': 'Data/Raw/LA/LA_clipped_parcels.geojson',
         #     'parks_path': 'Data/Raw/LA/la_parks.geojson',  # Corrected path for polygon parks
@@ -1617,8 +1671,8 @@ if __name__ == "__main__":
             'parks_path': 'Data/Raw/Houston/COH_PARKS_(City_of_Houston).geojson',  # Corrected path for polygon parks
             'streets_path': 'Data/Processed/lts_hou.geojson',
             'boundary_path': 'Data/Raw/Houston/houstoncitylimits.geojson',
-            'source_crs': 'EPSG:4326',
-            'target_crs': 'EPSG:32615',
+            'source_crs': 'EPSG:2278',
+            'target_crs': 'EPSG:4326',
             'output_dir': 'Visualizations',
             'lts_column': 'PC2_norm',
             # 'boundary_county_column': 'name',
@@ -1634,11 +1688,11 @@ if __name__ == "__main__":
     # Run analysis for all cities
     results = run_multi_city_analysis(cities_config)
     
-    # Access results for each city
+    # Print results
     for city_name, parcels_gdf in results.items():
         print(f"\n{city_name} Results:")
-        print(f"  Total parcels analyzed: {len(parcels_gdf)}")
+        print(f"  Total parcels: {len(parcels_gdf)}")
         valid = parcels_gdf[parcels_gdf['park_distance'] < float('inf')]
         if len(valid) > 0:
-            print(f"  Mean distance to parks: {valid['park_distance'].mean():.2f} meters")
-            print(f"  Median distance to parks: {valid['park_distance'].median():.2f} meters")
+            print(f"  Mean distance: {valid['park_distance'].mean():.2f} meters")
+            print(f"  Median distance: {valid['park_distance'].median():.2f} meters")
