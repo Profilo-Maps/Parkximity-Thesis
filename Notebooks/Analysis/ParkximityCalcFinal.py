@@ -1137,6 +1137,66 @@ class ParkProximityAnalyzer:
             print(f"Valid distances: min={valid_distances.min():.2f}, max={valid_distances.max():.2f}, mean={valid_distances.mean():.2f}")
         print(f"Parcels with valid distances: {len(valid_distances)}/{len(parcel_distances)}")
     
+    def export_parcels_geojson(self):
+        """
+        Export parcel data as GeoJSON with only geometry and parkximity calculations.
+        
+        Creates a simplified GeoJSON file containing:
+        - geometry: Original parcel geometry
+        - park_distance: LTS-weighted network distance to nearest park (meters)
+        - park_distance_km: Same distance in kilometers
+        
+        Returns:
+        --------
+        str : Path to the exported GeoJSON file
+        """
+        print(f"Exporting parcel parkximity data for {self.city_name}...")
+        
+        if len(self.parcels_gdf) == 0:
+            print("Warning: No parcels to export.")
+            return None
+        
+        # Create output directory
+        output_dir = Path(self.config['output_dir'])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Add distance in km if not already present
+        if 'park_distance_km' not in self.parcels_gdf.columns and 'park_distance' in self.parcels_gdf.columns:
+            self.parcels_gdf['park_distance_km'] = self.parcels_gdf['park_distance'] / 1000.0
+        
+        # Create a new GeoDataFrame with only geometry and parkximity columns
+        export_columns = ['geometry']
+        if 'park_distance' in self.parcels_gdf.columns:
+            export_columns.append('park_distance')
+        if 'park_distance_km' in self.parcels_gdf.columns:
+            export_columns.append('park_distance_km')
+        
+        export_gdf = self.parcels_gdf[export_columns].copy()
+        
+        # Reproject to WGS84 (EPSG:4326) for GeoJSON compatibility
+        export_gdf = export_gdf.to_crs("EPSG:4326")
+        
+        # Generate filename
+        output_filename = output_dir / f'{self.city_name.lower().replace(" ", "_")}_parcels_parkximity.geojson'
+        
+        # Export to GeoJSON
+        export_gdf.to_file(output_filename, driver='GeoJSON')
+        
+        print(f"Exported {len(export_gdf)} parcels to {output_filename}")
+        
+        # Print summary statistics
+        if 'park_distance_km' in export_gdf.columns:
+            valid_distances = export_gdf[export_gdf['park_distance_km'] < float('inf')]['park_distance_km']
+            if len(valid_distances) > 0:
+                print(f"  Distance statistics (km):")
+                print(f"    Min: {valid_distances.min():.3f}")
+                print(f"    Max: {valid_distances.max():.3f}")
+                print(f"    Mean: {valid_distances.mean():.3f}")
+                print(f"    Median: {valid_distances.median():.3f}")
+                print(f"  Parcels with valid distances: {len(valid_distances)}/{len(export_gdf)}")
+        
+        return str(output_filename)
+    
     def create_visualizations(self):
         """Create all visualization outputs."""
         output_dir = Path(self.config['output_dir'])
@@ -1149,9 +1209,6 @@ class ParkProximityAnalyzer:
         
         # Create parks-without-entrances diagnostic map
         self._create_parks_without_entrances_map(base_filename)
-        
-        # Create point map
-        self._create_point_map(base_filename)
         
         # Create heatmap
         self._create_heatmap(base_filename)
@@ -1266,57 +1323,7 @@ class ParkProximityAnalyzer:
         print(f"Saved parks-without-entrances diagnostic map to {diagnostic_filename}")
         print(f"  → {parks_without} parks highlighted in red")
     
-    def _create_point_map(self, base_filename):
-        """Create a point map of parcel distances."""
-        print("Creating point map visualization...")
-        
-        if len(self.parcels_gdf) == 0:
-            print("Warning: No parcels for point map.")
-            return
-        
-        fig, ax = plt.subplots(figsize=(20, 20))
-        
-        # Filter to valid distances
-        valid_parcels = self.parcels_gdf[self.parcels_gdf['park_distance'] < float('inf')].copy()
-        
-        if len(valid_parcels) == 0:
-            print("Warning: No valid distances for point map.")
-            return
-        
-        # Convert to km for display
-        valid_parcels['distance_km'] = valid_parcels['park_distance'] / 1000.0
-        
-        # Plot parcels colored by distance
-        valid_parcels.plot(
-            ax=ax,
-            column='distance_km',
-            cmap='RdYlGn_r',
-            markersize=1,
-            alpha=0.7,
-            legend=True,
-            legend_kwds={'label': 'Distance to Park (km)', 'shrink': 0.5}
-        )
-        
-        # Plot boundary
-        if self.boundary_gdf is not None:
-            self.boundary_gdf.plot(
-                ax=ax,
-                facecolor='none',
-                edgecolor='black',
-                linewidth=2
-            )
-        
-        ax.set_title(f'Park Accessibility by Parcel - {self.city_name}', fontsize=16, fontweight='bold')
-        ax.set_aspect('equal')
-        ax.set_xticks([])
-        ax.set_yticks([])
-        
-        plt.tight_layout()
-        pointmap_filename = f'{base_filename}_pointmap.png'
-        plt.savefig(pointmap_filename, dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        print(f"Saved point map to {pointmap_filename}")
+    
     
     def _create_heatmap(self, base_filename):
         """Create smoothed heatmap visualization."""
@@ -1562,7 +1569,8 @@ class ParkProximityAnalyzer:
         self.calculate_distances()
         self.calculate_parcel_distances()
         self.create_visualizations()
-        
+        self.export_parcels_geojson()
+
         print(f"\nAnalysis complete for {self.city_name}!")
         return self.parcels_gdf
 
@@ -1598,7 +1606,7 @@ if __name__ == "__main__":
         # 'Boston': {
         #     'parcels_path': 'Data/Raw/Boston/Parcels__2024_.geojson',
         #     'parks_path': 'Data/Raw/Boston/boston_parks.geojson',
-        #     'streets_path': 'Data/Processed/lts_bos.geojson',
+        #     'streets_path': 'Data/Processed/LTS/lts_bos.geojson',
         #     'boundary_path': 'Data/Raw/Boston/boston_neighborhood_boundaries.geojson.json',
         #     'output_dir': 'Visualizations/Boston',
         #     'lts_column': 'PC2_norm',
@@ -1613,7 +1621,7 @@ if __name__ == "__main__":
         # 'Houston': {
         #     'parcels_path': 'Data/Raw/Houston/houstonparcelsclipped.geojson',
         #     'parks_path': 'Data/Raw/Houston/COH_PARKS_(City_of_Houston).geojson',
-        #     'streets_path': 'Data/Processed/lts_hou.geojson',
+        #     'streets_path': 'Data/Processed/LTS/lts_hou.geojson',
         #     'boundary_path': 'Data/Raw/Houston/houstoncitylimits.geojson',
         #     'output_dir': 'Visualizations/Houston',
         #     'lts_column': 'PC2_norm',
@@ -1624,38 +1632,38 @@ if __name__ == "__main__":
         #     'heatmap_neighbors': 5,
         #     'heatmap_smoothing': 1
         # },
-        # 'NYC': {
-        #     'parcels_path': 'Data/Raw/NYC/NYC_clipped_parcels.geojson',
-        #     'parks_path': 'Data/Raw/NYC/Parks_Properties_20251120.geojson',
-        #     'streets_path': 'Data/Processed/lts_nyc.geojson',
-        #     'boundary_path': 'Data/Raw/NYC/NY_County_FeaturesToJSON.geojson',
-        #     'output_dir': 'Visualizations/NYC',
-        #     'lts_column': 'PC2_norm',
-        #     'combine_boundaries': False,
-        #     'park_buffer': 50.0,           # meters
-        #     'entrance_tolerance': 5.0,      # meters
-        #     'heatmap_resolution': 100,
-        #     'heatmap_neighbors': 5,
-        #     'heatmap_smoothing': 1
-        # },
-        # 'LA': {
-        #     'parcels_path': 'Data/Raw/LA/LA_clipped_parcels.geojson',
-        #     'parks_path': 'Data/Raw/LA/la_parks.geojson',
-        #     'streets_path': 'Data/Processed/lts_la.geojson',
-        #     'boundary_path': 'Data/Raw/LA/City_Boundary.geojson',
-        #     'output_dir': 'Visualizations/LA',
-        #     'lts_column': 'PC2_norm',
-        #     'combine_boundaries': False,
-        #     'park_buffer': 50.0,           # meters
-        #     'entrance_tolerance': 5.0,      # meters
-        #     'heatmap_resolution': 100,
-        #     'heatmap_neighbors': 5,
-        #     'heatmap_smoothing': 1
-        # },
+        'NYC': {
+            'parcels_path': 'Data/Raw/NYC/NYC_clipped_parcels.geojson',
+            'parks_path': 'Data/Raw/NYC/Parks_Properties_20251120.geojson',
+            'streets_path': 'Data/Processed/LTS/lts_nyc.geojson',
+            'boundary_path': 'Data/Raw/NYC/NY_County_FeaturesToJSON.geojson',
+            'output_dir': 'Visualizations/NYC',
+            'lts_column': 'PC2_norm',
+            'combine_boundaries': False,
+            'park_buffer': 50.0,           # meters
+            'entrance_tolerance': 5.0,      # meters
+            'heatmap_resolution': 100,
+            'heatmap_neighbors': 5,
+            'heatmap_smoothing': 1
+        },
+        'LA': {
+            'parcels_path': 'Data/Raw/LA/LA_clipped_parcels.geojson',
+            'parks_path': 'Data/Raw/LA/la_parks.geojson',
+            'streets_path': 'Data/Processed/LTS/lts_la.geojson',
+            'boundary_path': 'Data/Raw/LA/City_Boundary.geojson',
+            'output_dir': 'Visualizations/LA',
+            'lts_column': 'PC2_norm',
+            'combine_boundaries': False,
+            'park_buffer': 50.0,           # meters
+            'entrance_tolerance': 5.0,      # meters
+            'heatmap_resolution': 100,
+            'heatmap_neighbors': 5,
+            'heatmap_smoothing': 1
+        },
         'SF': {
             'parcels_path': 'Data/Raw/SF/Parcels_–_Active_and_Retired_20251208.geojson',
             'parks_path': 'Data/Raw/SF/Recreation_and_Parks_Properties_20251208.geojson',
-            'streets_path': 'Data/Processed/lts_sf.geojson',
+            'streets_path': 'Data/Processed/LTS/lts_sf.geojson',
             'boundary_path': 'Data/Raw/SF/SF_Boundary.geojson',
             'output_dir': 'Visualizations/SF',
             'lts_column': 'PC1',
