@@ -1,1 +1,57 @@
+# Data directories
 /Data
+/Data/
+Data.zip
+
+# Output directories
+/Exports
+/Exports/
+/Visualizations
+/Visualizations/
+/VisualizationsOld
+/Visualizations1
+/Visualizations_GPU
+
+# Python virtual environment
+/ParkXimityENV
+/venv
+/env
+*.pyc
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE settings
+/.kiro
+/.vscode
+/.idea
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Old/backup folders
+/Notebooks/Karna/Old
+*Old/
+*_old/
+*_backup/
+
+# Large result files
+*.zip
+*.tar.gz
+*.geojson
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.xml
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+~*

@@ -1,0 +1,16 @@
+# Hidden GPU dependencies file
+# This file is automatically used by the auto-installer
+# when GPU acceleration is requested
+
+name: parkximity
+channels:
+  - rapidsai
+  - conda-forge
+  - nvidia
+  - defaults
+
+dependencies:
+  # GPU Acceleration (RAPIDS stack)
+  - cuml=24.02
+  - cupy
+  - cudatoolkit=11.8

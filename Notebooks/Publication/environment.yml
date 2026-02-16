@@ -1,0 +1,49 @@
+name: parkximity
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python
+  - python=3.10
+
+  # Core Geospatial
+  - geopandas=0.14.*
+  - shapely=2.0.*
+  - pyproj=3.6.*
+  - fiona=1.9.*
+  - rtree=1.2.*
+
+  # Data Processing
+  - pandas=2.1.*
+  - numpy=1.26.*
+  - scipy=1.11.*
+
+  # Network Analysis
+  - networkx=3.2.*
+
+  # Visualization
+  - matplotlib=3.8.*
+  - seaborn=0.13.*
+
+  # Jupyter (for notebooks)
+  - jupyter
+  - ipykernel
+  - ipywidgets
+
+  # Utilities
+  - tqdm
+  - requests
+
+  # Fast JSON serialization
+  - orjson
+
+  # Development tools (optional but useful)
+  - black
+  - flake8
+  - pytest
+
+  # Pip packages
+  - pip
+  - pip:
+    - scikit-learn
