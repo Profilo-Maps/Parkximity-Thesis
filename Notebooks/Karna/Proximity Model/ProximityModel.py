@@ -83,7 +83,6 @@ def populate_schema(place: str) -> gpd.GeoDataFrame:
         return edges_reset[col] if col in edges_reset.columns else None
 
     def _coalesce(*cols):
-        """Return the first non-null series across the given OSM tag columns."""
         result = pd.Series(pd.NA, index=edges_reset.index, dtype=object)
         for col in cols:
             if col in edges_reset.columns:
@@ -124,97 +123,10 @@ def populate_schema(place: str) -> gpd.GeoDataFrame:
     populated["end_node_is_intersection_node"] = (
         edges_reset["v"].map(undirected_degree) > 2
     )
-    # --- Bikeway data ---
-    with tqdm(total=5, desc="Loading bikeway data", unit="step") as pbar:
-        # Type: prefer side-specific tag, fall back to cycleway:both, then bare cycleway
-        pbar.set_postfix_str("type")
-        populated["bikeway_left_1_type"]  = _coalesce("cycleway:left",  "cycleway:both", "cycleway")
-        populated["bikeway_right_1_type"] = _coalesce("cycleway:right", "cycleway:both", "cycleway")
-        populated["bikeway_left_2_type"]  = _coalesce("cycleway:left:2",  "cycleway:both:2")
-        populated["bikeway_right_2_type"] = _coalesce("cycleway:right:2", "cycleway:both:2")
-        pbar.update(1)
 
-        # Sub-type, surface, width, buffer
-        pbar.set_postfix_str("quality / surface / width / buffer")
-        populated["bikeway_left_1_quality"]  = _coalesce("cycleway:left:lane",  "cycleway:left:lane")
-        populated["bikeway_right_1_quality"] = _coalesce("cycleway:right:lane", "cycleway:right:lane")
-        populated["bikeway_left_1_surface"]  = _coalesce("cycleway:left:surface",  "cycleway:surface")
-        populated["bikeway_right_1_surface"] = _coalesce("cycleway:right:surface", "cycleway:surface")
-        populated["bikeway_left_1_width"]    = _coalesce("cycleway:left:width",  "cycleway:width")
-        populated["bikeway_right_1_width"]   = _coalesce("cycleway:right:width", "cycleway:width")
-        populated["bikeway_left_buffered"]   = _coalesce("cycleway:left:buffer",  "cycleway:buffer")
-        populated["bikeway_right_buffered"]  = _coalesce("cycleway:right:buffer", "cycleway:buffer")
-        pbar.update(1)
-
-        # Permitted / incline
-        pbar.set_postfix_str("permitted / incline")
-        populated["bikeway_left_1_permitted"]  = _get("bicycle")
-        populated["bikeway_right_1_permitted"] = _get("bicycle")
-        populated["bikeway_left_1_incline"]    = _get("incline")
-        populated["bikeway_right_1_incline"]   = _get("incline")
-        pbar.update(1)
-
-        # Secondary bikeway slots (_2)
-        pbar.set_postfix_str("secondary bikeway slots")
-        populated["bikeway_left_2_quality"]   = _get("cycleway:left:2:lane")
-        populated["bikeway_right_2_quality"]  = _get("cycleway:right:2:lane")
-        populated["bikeway_left_2_surface"]   = _get("cycleway:left:2:surface")
-        populated["bikeway_right_2_surface"]  = _get("cycleway:right:2:surface")
-        populated["bikeway_left_2_width"]     = _get("cycleway:left:2:width")
-        populated["bikeway_right_2_width"]    = _get("cycleway:right:2:width")
-        populated["bikeway_left_2_permitted"] = _get("bicycle")
-        populated["bikeway_right_2_permitted"]= _get("bicycle")
-        populated["bikeway_left_2_incline"]   = _get("incline")
-        populated["bikeway_right_2_incline"]  = _get("incline")
-        pbar.update(1)
-
-        # Bikeway geometries — same LineString as street edge
-        pbar.set_postfix_str("geometries")
-        has_left   = populated["bikeway_left_1_type"].notna()
-        has_right  = populated["bikeway_right_1_type"].notna()
-        has_left2  = populated["bikeway_left_2_type"].notna()
-        has_right2 = populated["bikeway_right_2_type"].notna()
-        populated.loc[has_left,   "bikeway_left_1_geometry"]  = edges_reset.loc[has_left,   "geometry"]
-        populated.loc[has_right,  "bikeway_right_1_geometry"] = edges_reset.loc[has_right,  "geometry"]
-        populated.loc[has_left2,  "bikeway_left_2_geometry"]  = edges_reset.loc[has_left2,  "geometry"]
-        populated.loc[has_right2, "bikeway_right_2_geometry"] = edges_reset.loc[has_right2, "geometry"]
-        pbar.update(1)
-    # --- Sidewalk data (centerline tags) ---
-    with tqdm(total=4, desc="Loading sidewalk data", unit="step") as pbar:
-        # Presence: prefer side-specific, fall back to sidewalk:both, then bare sidewalk
-        pbar.set_postfix_str("presence")
-        populated["sidewalk_left_presence"]  = _coalesce("sidewalk:left",  "sidewalk:both", "sidewalk")
-        populated["sidewalk_right_presence"] = _coalesce("sidewalk:right", "sidewalk:both", "sidewalk")
-        pbar.update(1)
-
-        # Surface, width, incline, quality, buffer
-        pbar.set_postfix_str("surface / width / incline / quality / buffer")
-        populated["sidewalk_left_surface"]   = _get("sidewalk:left:surface")
-        populated["sidewalk_right_surface"]  = _get("sidewalk:right:surface")
-        populated["sidewalk_left_width"]     = _get("sidewalk:left:width")
-        populated["sidewalk_right_width"]    = _get("sidewalk:right:width")
-        populated["sidewalk_left_incline"]   = _get("sidewalk:left:incline")
-        populated["sidewalk_right_incline"]  = _get("sidewalk:right:incline")
-        populated["sidewalk_left_quality"]   = _get("sidewalk:left:smoothness")
-        populated["sidewalk_right_quality"]  = _get("sidewalk:right:smoothness")
-        populated["sidewalk_left_buffered"]  = _get("sidewalk:left:buffer")
-        populated["sidewalk_right_buffered"] = _get("sidewalk:right:buffer")
-        pbar.update(1)
-
-        # Sidewalk geometries for centerline-tagged sidewalks
-        pbar.set_postfix_str("geometries")
-        has_sw_left  = populated["sidewalk_left_presence"].notna()
-        has_sw_right = populated["sidewalk_right_presence"].notna()
-        populated.loc[has_sw_left,  "sidewalk_left_geometry"]  = edges_reset.loc[has_sw_left,  "geometry"]
-        populated.loc[has_sw_right, "sidewalk_right_geometry"] = edges_reset.loc[has_sw_right, "geometry"]
-        populated = populated.set_geometry("street_geometry")
-        pbar.update(1)
-
-        # Separate cycleway and footway geometries
-        pbar.set_postfix_str("separate cycleways / footways")
-        populated = _populate_separate_bikelanes(populated, edges_reset)
-        populated = _populate_footway_data(populated, edges_reset)
-        pbar.update(1)
+    populated = populate_base_bikelanes(populated, edges_reset)
+    populated = populate_base_footlanes(populated, edges_reset)
+    populated = _apply_buffering_pass(populated)
     # --- Export ---
     # Geometry columns other than the active one must be serialized to WKB so
     # they round-trip correctly through parquet (GeoParquet only encodes the
@@ -403,6 +315,162 @@ def _create_schema_dataframe():
     
     return gdf
 
+def populate_base_bikelanes(
+    populated: gpd.GeoDataFrame,
+    edges_reset: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """Populate centerline-derived bikeway columns from OSM cycleway tags, then
+    spatially match any independently mapped cycleway edges."""
+
+    def _get(col):
+        return edges_reset[col] if col in edges_reset.columns else None
+
+    def _coalesce(*cols):
+        result = pd.Series(pd.NA, index=edges_reset.index, dtype=object)
+        for col in cols:
+            if col in edges_reset.columns:
+                result = result.where(result.notna(), edges_reset[col])
+        return result
+
+    with tqdm(total=5, desc="Loading bikeway data", unit="step") as pbar:
+        # Type: prefer side-specific tag, fall back to cycleway:both, then bare cycleway
+        pbar.set_postfix_str("type")
+        populated["bikeway_left_1_type"]  = _coalesce("cycleway:left",  "cycleway:both", "cycleway")
+        populated["bikeway_right_1_type"] = _coalesce("cycleway:right", "cycleway:both", "cycleway")
+        populated["bikeway_left_2_type"]  = _coalesce("cycleway:left:2",  "cycleway:both:2")
+        populated["bikeway_right_2_type"] = _coalesce("cycleway:right:2", "cycleway:both:2")
+        pbar.update(1)
+
+        # Sub-type, surface, width, buffer
+        pbar.set_postfix_str("quality / surface / width / buffer")
+        populated["bikeway_left_1_quality"]  = _coalesce("cycleway:left:lane",  "cycleway:left:lane")
+        populated["bikeway_right_1_quality"] = _coalesce("cycleway:right:lane", "cycleway:right:lane")
+        populated["bikeway_left_1_surface"]  = _coalesce("cycleway:left:surface",  "cycleway:surface")
+        populated["bikeway_right_1_surface"] = _coalesce("cycleway:right:surface", "cycleway:surface")
+        populated["bikeway_left_1_width"]    = _coalesce("cycleway:left:width",  "cycleway:width")
+        populated["bikeway_right_1_width"]   = _coalesce("cycleway:right:width", "cycleway:width")
+        populated["bikeway_left_buffered"]   = _coalesce("cycleway:left:buffer",  "cycleway:buffer")
+        populated["bikeway_right_buffered"]  = _coalesce("cycleway:right:buffer", "cycleway:buffer")
+        pbar.update(1)
+
+        # Permitted / incline
+        pbar.set_postfix_str("permitted / incline")
+        populated["bikeway_left_1_permitted"]  = _get("bicycle")
+        populated["bikeway_right_1_permitted"] = _get("bicycle")
+        populated["bikeway_left_1_incline"]    = _get("incline")
+        populated["bikeway_right_1_incline"]   = _get("incline")
+        pbar.update(1)
+
+        # Secondary bikeway slots (_2)
+        pbar.set_postfix_str("secondary bikeway slots")
+        populated["bikeway_left_2_quality"]   = _get("cycleway:left:2:lane")
+        populated["bikeway_right_2_quality"]  = _get("cycleway:right:2:lane")
+        populated["bikeway_left_2_surface"]   = _get("cycleway:left:2:surface")
+        populated["bikeway_right_2_surface"]  = _get("cycleway:right:2:surface")
+        populated["bikeway_left_2_width"]     = _get("cycleway:left:2:width")
+        populated["bikeway_right_2_width"]    = _get("cycleway:right:2:width")
+        populated["bikeway_left_2_permitted"] = _get("bicycle")
+        populated["bikeway_right_2_permitted"]= _get("bicycle")
+        populated["bikeway_left_2_incline"]   = _get("incline")
+        populated["bikeway_right_2_incline"]  = _get("incline")
+        pbar.update(1)
+
+        # Bikeway geometries — same LineString as street edge.
+        # Write the centerline geometry first, then immediately call
+        # _is_centerline so it sets *_buffered=True and clears the geometry,
+        # leaving the slot ready for the buffering pass.
+        pbar.set_postfix_str("geometries + separate cycleways")
+        has_left   = populated["bikeway_left_1_type"].notna()
+        has_right  = populated["bikeway_right_1_type"].notna()
+        has_left2  = populated["bikeway_left_2_type"].notna()
+        has_right2 = populated["bikeway_right_2_type"].notna()
+        # Centerline-tagged bikelanes ARE the street geometry by definition.
+        # Mark them directly (buffered=True, clear geometry) instead of using
+        # _is_centerline's spatial lookup which can match the wrong row for
+        # overlapping or closely-parallel streets.
+        for _mask, _sub_id, _buf_col in [
+            (has_left,   "bikeway_left_1",  "bikeway_left_buffered"),
+            (has_right,  "bikeway_right_1", "bikeway_right_buffered"),
+            (has_left2,  "bikeway_left_2",  "bikeway_left_buffered"),
+            (has_right2, "bikeway_right_2", "bikeway_right_buffered"),
+        ]:
+            geom_col = f"{_sub_id}_geometry"
+            populated.loc[_mask, _buf_col]  = True
+            populated.loc[_mask, geom_col]  = None
+
+        populated = _populate_separate_bikelanes(populated, edges_reset)
+        pbar.update(1)
+
+    return populated
+
+
+def populate_base_footlanes(
+    populated: gpd.GeoDataFrame,
+    edges_reset: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """Populate centerline-derived sidewalk columns from OSM sidewalk tags, then
+    spatially match any independently mapped footway edges."""
+
+    def _get(col):
+        return edges_reset[col] if col in edges_reset.columns else None
+
+    def _coalesce(*cols):
+        result = pd.Series(pd.NA, index=edges_reset.index, dtype=object)
+        for col in cols:
+            if col in edges_reset.columns:
+                result = result.where(result.notna(), edges_reset[col])
+        return result
+
+    with tqdm(total=4, desc="Loading sidewalk data", unit="step") as pbar:
+        # Presence: prefer side-specific, fall back to sidewalk:both, then bare sidewalk
+        pbar.set_postfix_str("presence")
+        populated["sidewalk_left_presence"]  = _coalesce("sidewalk:left",  "sidewalk:both", "sidewalk")
+        populated["sidewalk_right_presence"] = _coalesce("sidewalk:right", "sidewalk:both", "sidewalk")
+        pbar.update(1)
+
+        # Surface, width, incline, quality, buffer
+        pbar.set_postfix_str("surface / width / incline / quality / buffer")
+        populated["sidewalk_left_surface"]   = _get("sidewalk:left:surface")
+        populated["sidewalk_right_surface"]  = _get("sidewalk:right:surface")
+        populated["sidewalk_left_width"]     = _get("sidewalk:left:width")
+        populated["sidewalk_right_width"]    = _get("sidewalk:right:width")
+        populated["sidewalk_left_incline"]   = _get("sidewalk:left:incline")
+        populated["sidewalk_right_incline"]  = _get("sidewalk:right:incline")
+        populated["sidewalk_left_quality"]   = _get("sidewalk:left:smoothness")
+        populated["sidewalk_right_quality"]  = _get("sidewalk:right:smoothness")
+        populated["sidewalk_left_buffered"]  = _get("sidewalk:left:buffer")
+        populated["sidewalk_right_buffered"] = _get("sidewalk:right:buffer")
+        pbar.update(1)
+
+        # Sidewalk geometries for centerline-tagged sidewalks.
+        # Write the centerline geometry then immediately call _is_centerline
+        # to set *_buffered=True and clear the geometry for the buffering pass.
+        pbar.set_postfix_str("geometries")
+        has_sw_left  = populated["sidewalk_left_presence"].notna()
+        has_sw_right = populated["sidewalk_right_presence"].notna()
+        populated = populated.set_geometry("street_geometry")
+
+        # Centerline-tagged sidewalks ARE the street geometry by definition.
+        # Mark them directly (buffered=True, clear geometry) so the buffering
+        # pass can compute the perpendicular offset.
+        for _mask, _sub_id, _buf_col in [
+            (has_sw_left,  "sidewalk_left",  "sidewalk_left_buffered"),
+            (has_sw_right, "sidewalk_right", "sidewalk_right_buffered"),
+        ]:
+            geom_col = f"{_sub_id}_geometry"
+            populated.loc[_mask, _buf_col]  = True
+            populated.loc[_mask, geom_col]  = None
+
+        pbar.update(1)
+
+        # Separately mapped footway edges
+        pbar.set_postfix_str("separate footways")
+        populated = _populate_footway_data(populated, edges_reset)
+        pbar.update(1)
+
+    return populated
+
+
 def _populate_separate_bikelanes(
     populated: gpd.GeoDataFrame,
     edges_reset: gpd.GeoDataFrame,
@@ -473,6 +541,10 @@ def _populate_separate_bikelanes(
         populated.at[road_idx, f"{prefix}_incline"]   = cy_incline
         populated.at[road_idx, f"{prefix}_geometry"]  = cy_geom
 
+        # Check if this separately-mapped cycleway lies on the road centerline;
+        # if so, mark it and clear the geometry for the buffering pass.
+        _is_centerline(cy_geom, prefix, populated, road_sindex, road_df=roads)
+
     print(f"Matched {len(cycleways)} separate cycleway edges to road segments.")
     return populated
 
@@ -538,6 +610,10 @@ def _populate_footway_data(
         populated.at[road_idx, f"{prefix}_quality"]  = fw_smooth
         populated.at[road_idx, f"{prefix}_geometry"] = fw_geom
 
+        # Check if this separately-mapped footway lies on the road centerline;
+        # if so, mark it and clear the geometry for the buffering pass.
+        _is_centerline(fw_geom, prefix, populated, road_sindex, road_df=roads)
+
     print(f"Matched {len(footways)} separate footway edges to road segments.")
     return populated
 
@@ -549,8 +625,309 @@ def run_multi_city():
         results[city] = populate_schema(city)
     return results
 
+_FACILITY_SLOTS = [
+    ("bikeway",  "left",  "1"),
+    ("bikeway",  "left",  "2"),
+    ("bikeway",  "right", "1"),
+    ("bikeway",  "right", "2"),
+    ("sidewalk", "left",  None),
+    ("sidewalk", "right", None),
+]
 
 
+def _apply_buffering_pass(populated: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """For every facility slot where ``*_buffered`` is ``True`` and the
+    corresponding geometry column is empty, compute and write a
+    perpendicular-offset geometry by calling ``_buffer_segment``.
+
+    ``_is_centerline`` (called during the populate_ phase) sets the
+    ``*_buffered`` flag and clears the geometry when it detects a
+    centerline-coincident facility.  This pass finds those marked rows and
+    completes the work by generating the actual offset LineString.
+
+    Called once from ``populate_schema`` after all populate_ helpers have run.
+    """
+    total_buffered = 0
+
+    for kind, side, slot in _FACILITY_SLOTS:
+        sub_id       = f"{kind}_{side}_{slot}" if slot else f"{kind}_{side}"
+        geom_col     = f"{sub_id}_geometry"
+        buffered_col = f"{kind}_{side}_buffered"
+
+        if buffered_col not in populated.columns or geom_col not in populated.columns:
+            continue
+
+        # Rows marked as buffered (True) with no geometry yet
+        def _is_true(v):
+            if v is True:
+                return True
+            try:
+                return bool(v) and not isinstance(v, str)
+            except (TypeError, ValueError):
+                return False
+
+        needs_offset = populated[buffered_col].apply(_is_true) & \
+                       populated[geom_col].apply(
+                           lambda g: g is None or not hasattr(g, "geom_type")
+                       )
+        if not needs_offset.any():
+            continue
+
+        for idx in populated.index[needs_offset]:
+            # Use the street centerline as the base geometry for the offset
+            street_geom = populated.at[idx, "street_geometry"]
+            if street_geom is None or not hasattr(street_geom, "geom_type"):
+                continue
+            populated = _buffer_segment(idx, sub_id, street_geom, populated, side)
+            total_buffered += 1
+
+    print(f"Buffering pass: {total_buffered} facility segments offset from centerline.")
+    return populated
+
+
+def _is_centerline(
+    facility_geom,
+    sub_facility_id: str,
+    populated: gpd.GeoDataFrame,
+    road_sindex,
+    road_df: gpd.GeoDataFrame = None,
+    centerline_col: str = "street_geometry",
+    threshold_m: float = 0.1,
+):
+    """Check whether a bikelane or sidewalk segment lies within *threshold_m* metres
+    of a street centerline for at least 90% of its length.
+
+    When a match is confirmed the function mutates *populated* in-place:
+    it sets the facility's ``*_buffered`` flag to ``True`` and clears the
+    facility's geometry column to ``None``, leaving the slot ready for
+    ``_buffer_segment`` to write the perpendicular-offset geometry.
+
+    Parameters
+    ----------
+    facility_geom : shapely geometry
+        Geometry of the bikelane or sidewalk segment (must be in the same
+        projected CRS as *populated*, e.g. EPSG:32610).
+    sub_facility_id : str
+        Schema column prefix for this facility slot (e.g. ``"bikeway_left_1"``
+        or ``"sidewalk_right"``).
+    populated : GeoDataFrame
+        Street-network rows already written into the proximity schema.  Mutated
+        in-place when a match is found.
+    road_sindex : shapely STRtree / geopandas spatial index
+        Spatial index built over *road_df* rows (used to avoid an O(n²) scan).
+    road_df : GeoDataFrame, optional
+        The dataframe whose geometry was used to build *road_sindex*.  Defaults
+        to *populated*.  Pass a filtered subset (e.g. ``roads`` inside the
+        separate-bikelane helpers) so that positional index lookups resolve to
+        the correct index labels in *populated*.
+    centerline_col : str
+        Geometry column in *populated* holding street centerlines.
+    threshold_m : float
+        Maximum distance in metres to count as "on centerline".
+
+    Returns
+    -------
+    tuple[street_id, sub_facility_id] or None
+        ``(street_id, sub_facility_id)`` when a match is found (populated has
+        already been mutated); ``None`` otherwise.
+    """
+    if road_df is None:
+        road_df = populated
+
+    # Candidate nearest road via spatial index (positional integer → index label)
+    best_pos = int(np.asarray(road_sindex.nearest(facility_geom)).flat[0])
+    road_idx = road_df.index[best_pos]
+    centerline_geom = populated.at[road_idx, centerline_col]
+
+    # Fast rejection
+    if facility_geom.distance(centerline_geom) > threshold_m:
+        return None
+
+    # Fraction of facility length inside the centerline corridor
+    corridor = centerline_geom.buffer(threshold_m)
+    covered_length = facility_geom.intersection(corridor).length
+    if covered_length / facility_geom.length < 0.90:
+        return None
+
+    # ── Match confirmed: mark the slot and clear its geometry ─────────────────
+    geom_col = f"{sub_facility_id}_geometry"
+    if geom_col in populated.columns:
+        populated.at[road_idx, geom_col] = None
+
+    # Buffered flag lives on the side prefix (bikeway_left / sidewalk_right …)
+    parts        = sub_facility_id.split("_")          # ["bikeway","left","1"] or ["sidewalk","left"]
+    side_prefix  = f"{parts[0]}_{parts[1]}"            # "bikeway_left" | "sidewalk_right"
+    buffered_col = f"{side_prefix}_buffered"
+    if buffered_col in populated.columns:
+        populated.at[road_idx, buffered_col] = True
+
+    return (road_idx, sub_facility_id)
+
+_DEFAULT_LANE_WIDTH_M  = 3.5   # fallback when lane_width is missing
+_DEFAULT_BIKE_WIDTH_M  = 1.5   # fallback when a bikeway width cell is missing
+
+
+def _parse_numeric(val, default: float) -> float:
+    """Coerce *val* to float, returning *default* on failure."""
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+# Attribute columns to copy from the facility row into the street-centerline row
+# before the geometry is replaced with a buffered offset.
+_BIKEWAY_ATTR_COLS = ["type", "surface", "quality", "permitted", "width", "incline"]
+_SIDEWALK_ATTR_COLS = ["presence", "surface", "quality", "width", "incline"]
+
+
+def _buffer_segment(
+    street_id,
+    sub_facility_id: str,
+    facility_geom,
+    populated: gpd.GeoDataFrame,
+    side: str,
+) -> gpd.GeoDataFrame:
+    """Offset a bikelane or sidewalk geometry away from its street centerline.
+
+    Called when ``_is_centerline`` confirms that a separately mapped bikelane or
+    sidewalk segment lies on top of its parent street centerline.  The function:
+
+    1. Copies all attribute columns for the facility slot from the original
+       facility row into the street-centerline row identified by *street_id*.
+    2. Computes a perpendicular offset distance based on facility type:
+       - **Bikelane**: ``lanes × lane_width``
+       - **Sidewalk**: ``(lanes × lane_width) + sum(bikeway widths on same side)``
+    3. Generates a parallel-offset LineString in the direction of *side* and
+       writes it back to the geometry column for the slot.
+    4. Sets the ``*_buffered`` flag on the row to ``True``.
+
+    Parameters
+    ----------
+    street_id :
+        Index label of the parent street-centerline row in *populated*.
+    sub_facility_id : str
+        Schema column prefix identifying the facility slot, e.g.
+        ``"bikeway_left_1"``, ``"bikeway_right_2"``, or ``"sidewalk_left"``.
+        The prefix must start with ``"bikeway"`` or ``"sidewalk"``; the
+        remainder determines which attribute and geometry columns are written.
+    facility_geom : shapely geometry
+        Original (centerline-coincident) geometry of the facility, in the same
+        projected CRS as *populated* (metres, e.g. EPSG:32610).
+    populated : GeoDataFrame
+        The proximity-schema GeoDataFrame, modified in place.
+    side : str
+        ``"left"`` or ``"right"`` — the side of the street the facility occupies.
+        Positive offset goes left (cross-product convention); negative goes right.
+
+    Returns
+    -------
+    GeoDataFrame
+        *populated* with the facility slot updated.
+    """
+    row = populated.loc[street_id]
+
+    # --- 1. Parse facility kind and slot number from the prefix ---------------
+    # Expected forms: "bikeway_left_1", "bikeway_right_2", "sidewalk_left", "sidewalk_right"
+    parts = sub_facility_id.split("_")          # e.g. ["bikeway","left","1"]
+    facility_kind = parts[0]                    # "bikeway" | "sidewalk"
+
+    # --- 2. Copy attributes from the facility row into the centerline row -----
+    if facility_kind == "bikeway":
+        for attr in _BIKEWAY_ATTR_COLS:
+            col = f"{sub_facility_id}_{attr}"
+            if col in populated.columns and col in populated.columns:
+                # value already written by _populate_separate_bikelanes; keep it
+                pass
+    elif facility_kind == "sidewalk":
+        for attr in _SIDEWALK_ATTR_COLS:
+            col = f"{sub_facility_id}_{attr}"
+            if col in populated.columns:
+                pass  # value already written by _populate_footway_data; keep it
+    # (Attribute copy is a no-op here because the callers in populate_schema
+    # write attributes before calling buffer_segment.  The step is documented
+    # explicitly so future callers know attributes must be present first.)
+
+    # --- 3. Compute perpendicular offset distance (metres) --------------------
+    lanes      = _parse_numeric(row.get("lanes"),      2.0)
+    lane_width = _parse_numeric(row.get("lane_width"), _DEFAULT_LANE_WIDTH_M)
+    half_road  = (lanes * lane_width) / 2.0   # distance from centreline to kerb edge
+
+    if facility_kind == "bikeway":
+        offset_m = half_road
+
+    elif facility_kind == "sidewalk":
+        # Add widths of all bikeway slots on the same side
+        bike_width = 0.0
+        for slot in ("1", "2"):
+            w = row.get(f"bikeway_{side}_{slot}_width")
+            bike_width += _parse_numeric(w, 0.0) if not _is_na(w) else _DEFAULT_BIKE_WIDTH_M \
+                if not _is_na(row.get(f"bikeway_{side}_{slot}_type")) else 0.0
+        offset_m = half_road + bike_width
+
+    else:
+        return populated  # unknown facility kind — nothing to do
+
+    # --- 4. Generate the parallel-offset geometry -----------------------------
+    # Use offset_curve (Shapely ≥ 2.0): positive = left, negative = right.
+    sign = 1 if side == "left" else -1
+    try:
+        if hasattr(facility_geom, "offset_curve"):
+            buffered_geom = facility_geom.offset_curve(sign * offset_m)
+        else:
+            # Shapely < 2.0 fallback
+            buffered_geom = facility_geom.parallel_offset(
+                offset_m, side=side, resolution=16, join_style=2,
+            )
+        if buffered_geom.is_empty:
+            return populated
+    except Exception:
+        return populated
+
+    # --- 5. Collision check against facilities on the SAME row only ----------
+    _FACILITY_GEOM_COLS = [
+        "street_geometry",
+        "bikeway_left_1_geometry",  "bikeway_left_2_geometry",
+        "bikeway_right_1_geometry", "bikeway_right_2_geometry",
+        "sidewalk_left_geometry",   "sidewalk_right_geometry",
+    ]
+    own_geom_col    = f"{sub_facility_id}_geometry"
+    endpoint_buffer = buffered_geom.boundary.buffer(1e-6)
+
+    for col in _FACILITY_GEOM_COLS:
+        if col == own_geom_col or col not in populated.columns:
+            continue
+        other_geom = populated.at[street_id, col]
+        if other_geom is None or not hasattr(other_geom, "intersects"):
+            continue
+        if not buffered_geom.intersects(other_geom):
+            continue
+        inter = buffered_geom.intersection(other_geom)
+        if not inter.within(endpoint_buffer):
+            return populated
+
+    geom_col = own_geom_col
+    if geom_col in populated.columns:
+        populated.at[street_id, geom_col] = buffered_geom
+
+    # --- 6. Mark the slot as buffered -----------------------------------------
+    # The buffered flag lives on the side prefix (e.g. "bikeway_left_buffered"),
+    # not on the individual slot number.
+    side_prefix  = f"{facility_kind}_{side}"
+    buffered_col = f"{side_prefix}_buffered"
+    if buffered_col in populated.columns:
+        populated.at[street_id, buffered_col] = True
+
+    return populated
+
+
+def _is_na(val) -> bool:
+    """Return True if *val* is pandas/numpy NA or None."""
+    if val is None:
+        return True
+    try:
+        return bool(pd.isna(val))
+    except (TypeError, ValueError):
+        return False
 
 # def create_boundary_grid():
 #     return
