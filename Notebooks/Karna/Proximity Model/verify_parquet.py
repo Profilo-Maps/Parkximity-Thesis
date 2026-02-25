@@ -9,6 +9,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from shapely import wkb as shapely_wkb
+from shapely import Point
 
 # ============================================================================
 # Configuration
@@ -79,18 +80,21 @@ def verify_parquet_file(config):
     parquet_path = Path(config['path'])
     sanity_path = Path(config.get('sanity_path', ''))
     city_name = config['name']
-    
+
     print("\n" + "=" * 80)
     print(f"VERIFYING: {city_name}")
     print("=" * 80)
-    
+
     # Check network file
     if not parquet_path.exists():
         print(f"❌ Network file not found: {parquet_path}")
         return None
-    
+
     print(f"✓ Found network parquet: {parquet_path}")
     print(f"  File size: {parquet_path.stat().st_size / 1024 / 1024:.2f} MB")
+
+    # Read the dataframe
+    df = pd.read_parquet(parquet_path)
     
     # Check sanity file
     if sanity_path.exists():
@@ -119,181 +123,145 @@ def verify_parquet_file(config):
     parquet_file = pq.ParquetFile(parquet_path)
     arrow_schema = parquet_file.schema_arrow
     
-    print("SCHEMA INFORMATION")
-    print("-" * 80)
-    print(f"Total columns: {len(arrow_schema)}")
-    print(f"Total rows: {parquet_file.metadata.num_rows}")
-    
-    # Check for 152+ columns requirement
-    if len(arrow_schema) >= 152:
-        print(f"✓ Schema has {len(arrow_schema)} columns (meets 152+ requirement)")
-    else:
-        print(f"⚠ Schema has only {len(arrow_schema)} columns (expected 152+)")
-    
-    print()
-    
-    # Check for list-type columns
-    print("List-type columns:")
-    list_columns = []
-    for field in arrow_schema:
-        if str(field.type).startswith('list'):
-            list_columns.append(field.name)
-            print(f"  - {field.name}: {field.type}")
-    
-    print(f"\nTotal list-type columns: {len(list_columns)}\n")
-    
-    # Load data to inspect content
-    print("DATA SAMPLE")
-    print("-" * 80)
-    df = pd.read_parquet(parquet_path)
-    
-    print(f"DataFrame shape: {df.shape}")
-    print(f"Memory usage: {df.memory_usage(deep=True).sum() / 1024 / 1024:.2f} MB\n")
-    
-    # Show sample of list-type columns
-    print("Sample values from list-type columns:")
-    print("(Searching for populated examples...)\n")
-    
-    # Collect statistics for table
-    table_data = []
-    
-    for col in list_columns:
-        if col in df.columns:
-            print(f"{col}:")
-            
-            # Find first non-null value
-            first_non_null_idx = df[col].first_valid_index()
-            first_val = None
-            if first_non_null_idx is not None:
-                first_val = df[col].loc[first_non_null_idx]
-                print(f"  First non-null (row {first_non_null_idx}): {first_val}")
-            
-            # Find first value with multiple items (actual list)
-            found_multi = False
-            multi_val = None
-            multi_idx = None
-            for idx, val in df[col].items():
-                if val is not None and hasattr(val, '__len__') and len(val) > 1:
-                    print(f"  First multi-value (row {idx}): {val}")
-                    found_multi = True
-                    multi_val = val
-                    multi_idx = idx
-                    break
-            
-            if not found_multi:
-                print(f"  No multi-value examples found")
-            
-            # Statistics
-            non_null_count = df[col].notna().sum()
-            multi_count = df[col].apply(lambda x: x is not None and hasattr(x, '__len__') and len(x) > 1).sum()
-            total_count = len(df[col])
-            
-            print(f"  → {non_null_count}/{total_count} rows non-null ({non_null_count/total_count*100:.1f}%)")
-            print(f"  → {multi_count}/{total_count} rows have multiple values ({multi_count/total_count*100:.1f}%)")
-            print()
-            
-            # Add to table data
-            table_data.append({
-                'Column': col,
-                'Non-Null': non_null_count,
-                'Non-Null %': f"{non_null_count/total_count*100:.1f}%",
-                'Multi-Value': multi_count,
-                'Multi-Value %': f"{multi_count/total_count*100:.1f}%",
-                'Has Example': '✓' if first_non_null_idx is not None else '✗',
-                'Has Multi': '✓' if found_multi else '✗'
-            })
-    
-    # Print summary table
-    print("LIST-TYPE COLUMNS SUMMARY TABLE")
-    print("-" * 80)
-    print(f"{'Column':<20} {'Non-Null':<12} {'%':<8} {'Multi-Val':<12} {'%':<8} {'Example':<8} {'Multi':<8}")
-    print("-" * 80)
-    for row in table_data:
-        print(f"{row['Column']:<20} {row['Non-Null']:<12} {row['Non-Null %']:<8} {row['Multi-Value']:<12} {row['Multi-Value %']:<8} {row['Has Example']:<8} {row['Has Multi']:<8}")
-    print("=" * 80)
-    
     # Check for expected columns
     print("\nEXPECTED COLUMNS CHECK (ProximityModel.py)")
     print("-" * 80)
     
     expected_columns = [
-        # Core street columns
-        'block_ids', 'street_osmid', 'public_data_id_street',
-        'start_node_osmid', 'end_node_osmid', 'public_data_id_start_end_nodes',
-        'normalized_bearing', 'bearing',
-        'name', 'highway', 'maxspeed', 'oneway', 'lanes', 'lane_width', 'surface',
-        
-        # Street features
+        # Street Centerline
+        'block_ids', 'street_id', 'block_sides', 'public_data_id_street',
+        'start_node_id', 'start_node_is_block_node', 'start_node_is_intersection_node',
+        'end_node_id', 'end_node_is_block_node', 'end_node_is_intersection_node',
+        'public_data_id_start_end_nodes',
+        'normalized_bearing', 'name', 'highway', 'maxspeed', 'oneway', 'lanes', 'lane_width', 'surface',
+
+        # Street Centerline Features
         'street_feature_types', 'public_data_id_street_feature',
         'street_feature_geometry', 'street_feature_geometry_projected',
-        
-        # Sidewalk columns
+
+        # Sidewalk Centerlines (Left)
         'sidewalk_left_ID', 'sidewalk_left_block_ID', 'sidewalk_left_presence',
-        'sidewalk_left_surface', 'sidewalk_left_width', 'sidewalk_left_incline',
-        'sidewalk_left_buffered',
-        'sidewalk_right_ID', 'sidewalk_right_block_ID', 'sidewalk_right_presence',
-        'sidewalk_right_surface', 'sidewalk_right_width', 'sidewalk_right_incline',
-        'sidewalk_right_buffered',
-        
-        # Sidewalk features
-        'sidewalk_left_feature_ids', 'sidewalk_left_feature_types',
-        'public_data_id_sidewalk_left_feature',
-        'sidewalk_left_feature_geometry', 'sidewalk_left_feature_geometry_projected',
-        'sidewalk_right_feature_ids', 'sidewalk_right_feature_types',
-        'public_data_id_sidewalk_right_feature',
-        'sidewalk_right_feature_geometry', 'sidewalk_right_feature_geometry_projected',
-        
-        # Curb ramp columns (sample)
-        'sidewalk_left_curbramp_start_1_ID', 'sidewalk_left_curbramp_start_1_geometry',
-        'public_data_id_sidewalk_left_curbramp_start_1',
+        'public_data_id_sidewalk_left', 'sidewalk_left_surface', 'sidewalk_left_quality',
+        'sidewalk_left_width', 'sidewalk_left_incline', 'sidewalk_left_buffered',
+
+        # Curb Ramp (Left, Start, 1-3)
+        'sidewalk_left_curbramp_start_1_ID', 'public_data_id_sidewalk_left_curbramp_start_1',
         'sidewalk_left_curbramp_start_1_returnloc', 'sidewalk_left_curbramp_start_1_returnposition',
-        'sidewalk_left_curbramp_start_1_condition_score',
-        
-        # Crosswalk columns
+        'sidewalk_left_curbramp_start_1_condition_score', 'sidewalk_left_curbramp_start_1_geometry',
+        'sidewalk_left_curbramp_start_2_ID', 'public_data_id_sidewalk_left_curbramp_start_2',
+        'sidewalk_left_curbramp_start_2_returnloc', 'sidewalk_left_curbramp_start_2_returnposition',
+        'sidewalk_left_curbramp_start_2_condition_score', 'sidewalk_left_curbramp_start_2_geometry',
+        'sidewalk_left_curbramp_start_3_ID', 'public_data_id_sidewalk_left_curbramp_start_3',
+        'sidewalk_left_curbramp_start_3_returnloc', 'sidewalk_left_curbramp_start_3_returnposition',
+        'sidewalk_left_curbramp_start_3_condition_score', 'sidewalk_left_curbramp_start_3_geometry',
+
+        # Curb Ramp (Left, End, 1-3)
+        'sidewalk_left_curbramp_end_1_ID', 'public_data_id_sidewalk_left_curbramp_end_1',
+        'sidewalk_left_curbramp_end_1_returnloc', 'sidewalk_left_curbramp_end_1_returnposition',
+        'sidewalk_left_curbramp_end_1_condition_score', 'sidewalk_left_curbramp_end_1_geometry',
+        'sidewalk_left_curbramp_end_2_ID', 'public_data_id_sidewalk_left_curbramp_end_2',
+        'sidewalk_left_curbramp_end_2_returnloc', 'sidewalk_left_curbramp_end_2_returnposition',
+        'sidewalk_left_curbramp_end_2_condition_score', 'sidewalk_left_curbramp_end_2_geometry',
+        'sidewalk_left_curbramp_end_3_ID', 'public_data_id_sidewalk_left_curbramp_end_3',
+        'sidewalk_left_curbramp_end_3_returnloc', 'sidewalk_left_curbramp_end_3_returnposition',
+        'sidewalk_left_curbramp_end_3_condition_score', 'sidewalk_left_curbramp_end_3_geometry',
+
+        # Sidewalk Centerline Features (Left)
+        'sidewalk_left_feature_ids', 'sidewalk_left_feature_types',
+        'public_data_id_sidewalk_left_feature', 'sidewalk_left_feature_geometry',
+        'sidewalk_left_feature_geometry_projected',
+
+        # Sidewalk Centerlines (Right)
+        'sidewalk_right_ID', 'sidewalk_right_block_ID', 'sidewalk_right_presence',
+        'public_data_id_sidewalk_right', 'sidewalk_right_surface', 'sidewalk_right_quality',
+        'sidewalk_right_width', 'sidewalk_right_incline', 'sidewalk_right_buffered',
+
+        # Curb Ramp (Right, Start, 1-3)
+        'sidewalk_right_curbramp_start_1_ID', 'public_data_id_sidewalk_right_curbramp_start_1',
+        'sidewalk_right_curbramp_start_1_returnloc', 'sidewalk_right_curbramp_start_1_returnposition',
+        'sidewalk_right_curbramp_start_1_condition_score', 'sidewalk_right_curbramp_start_1_geometry',
+        'sidewalk_right_curbramp_start_2_ID', 'public_data_id_sidewalk_right_curbramp_start_2',
+        'sidewalk_right_curbramp_start_2_returnloc', 'sidewalk_right_curbramp_start_2_returnposition',
+        'sidewalk_right_curbramp_start_2_condition_score', 'sidewalk_right_curbramp_start_2_geometry',
+        'sidewalk_right_curbramp_start_3_ID', 'public_data_id_sidewalk_right_curbramp_start_3',
+        'sidewalk_right_curbramp_start_3_returnloc', 'sidewalk_right_curbramp_start_3_returnposition',
+        'sidewalk_right_curbramp_start_3_condition_score', 'sidewalk_right_curbramp_start_3_geometry',
+
+        # Curb Ramp (Right, End, 1-3)
+        'sidewalk_right_curbramp_end_1_ID', 'public_data_id_sidewalk_right_curbramp_end_1',
+        'sidewalk_right_curbramp_end_1_returnloc', 'sidewalk_right_curbramp_end_1_returnposition',
+        'sidewalk_right_curbramp_end_1_condition_score', 'sidewalk_right_curbramp_end_1_geometry',
+        'sidewalk_right_curbramp_end_2_ID', 'public_data_id_sidewalk_right_curbramp_end_2',
+        'sidewalk_right_curbramp_end_2_returnloc', 'sidewalk_right_curbramp_end_2_returnposition',
+        'sidewalk_right_curbramp_end_2_condition_score', 'sidewalk_right_curbramp_end_2_geometry',
+        'sidewalk_right_curbramp_end_3_ID', 'public_data_id_sidewalk_right_curbramp_end_3',
+        'sidewalk_right_curbramp_end_3_returnloc', 'sidewalk_right_curbramp_end_3_returnposition',
+        'sidewalk_right_curbramp_end_3_condition_score', 'sidewalk_right_curbramp_end_3_geometry',
+
+        # Sidewalk Centerline Features (Right)
+        'sidewalk_right_feature_ids', 'sidewalk_right_feature_types',
+        'public_data_id_sidewalk_right_feature', 'sidewalk_right_feature_geometry',
+        'sidewalk_right_feature_geometry_projected',
+
+        # Crosswalk (Start)
         'crosswalk_start_id', 'crosswalk_start_block_ids', 'crosswalk_start_type',
-        'public_data_id_crosswalk_start',
-        'crosswalk_start_controlled', 'crosswalk_start_marked', 'crosswalk_start_markings',
-        'crosswalk_start_signals', 'crosswalk_start_island', 'crosswalk_start_kerb',
-        'crosswalk_start_tactile_paving', 'crosswalk_start_traffic_calming',
-        'crosswalk_start_continuous', 'crosswalk_start_condition',
-        'crosswalk_start_geometry',
+        'public_data_id_crosswalk_start', 'crosswalk_start_controlled', 'crosswalk_start_marked',
+        'crosswalk_start_markings', 'crosswalk_start_signals', 'crosswalk_start_island',
+        'crosswalk_start_kerb', 'crosswalk_start_tactile_paving', 'crosswalk_start_traffic_calming',
+        'crosswalk_start_continuous', 'crosswalk_start_condition', 'crosswalk_start_geometry',
+        'crosswalk_start_island_geometry',
+
+        # Crosswalk (End)
         'crosswalk_end_id', 'crosswalk_end_block_ids', 'crosswalk_end_type',
-        'public_data_id_crosswalk_end',
-        'crosswalk_end_geometry',
-        
-        # Bikeway columns
-        'oneway_bicycle',
+        'public_data_id_crosswalk_end', 'crosswalk_end_controlled', 'crosswalk_end_marked',
+        'crosswalk_end_markings', 'crosswalk_end_signals', 'crosswalk_end_island',
+        'crosswalk_end_kerb', 'crosswalk_end_tactile_paving', 'crosswalk_end_traffic_calming',
+        'crosswalk_end_continuous', 'crosswalk_end_condition', 'crosswalk_end_geometry',
+        'crosswalk_end_island_geometry',
+
+        # Bikeway Centerline (Left, 1)
         'bikeway_left_1_id', 'bikeway_left_1_block_id', 'public_data_id_bikeway_left_1',
-        'bikeway_left_1_type', 'bikeway_left_1_surface', 'bikeway_left_1_permitted',
-        'bikeway_left_1_width', 'bikeway_left_1_incline',
+        'bikeway_left_1_type', 'bikeway_left_1_surface', 'bikeway_left_1_quality',
+        'bikeway_left_1_permitted', 'bikeway_left_1_width', 'bikeway_left_1_incline',
         'bikeway_left_buffered',
-        'bikeway_left_2_id', 'bikeway_left_2_block_id', 'public_data_id_bikeway_left_2',
-        'bikeway_left_2_type', 'bikeway_left_2_surface', 'bikeway_left_2_permitted',
+
+        # Bikeway Centerline (Left, 2)
+        'bikeway_left_2_id', 'public_data_id_bikeway_left_2', 'bikeway_left_2_type',
+        'bikeway_left_2_surface', 'bikeway_left_2_quality', 'bikeway_left_2_permitted',
         'bikeway_left_2_width', 'bikeway_left_2_incline',
-        'bikeway_right_1_id', 'bikeway_right_1_block_id', 'public_data_id_bikeway_right_1',
-        'bikeway_right_1_type', 'bikeway_right_1_surface', 'bikeway_right_1_permitted',
-        'bikeway_right_1_width', 'bikeway_right_1_incline',
-        'bikeway_right_buffered',
-        'bikeway_right_2_id', 'bikeway_right_2_block_id', 'public_data_id_bikeway_right_2',
-        'bikeway_right_2_type', 'bikeway_right_2_surface', 'bikeway_right_2_permitted',
-        'bikeway_right_2_width', 'bikeway_right_2_incline',
-        
-        # Bikeway features
+
+        # Bikeway Centerline Features (Left, 1)
         'bikeway_left_1_feature_ids', 'bikeway_left_1_feature_types',
-        'public_data_id_bikeway_left_1_features',
-        'bikeway_left_1_feature_geometry', 'bikeway_left_1_feature_geometry_projected',
+        'public_data_id_bikeway_left_1_features', 'bikeway_left_1_feature_geometry',
+        'bikeway_left_1_feature_geometry_projected',
+
+        # Bikeway Centerline Features (Left, 2)
         'bikeway_left_2_feature_types', 'public_data_id_bikeway_left_2_features',
         'bikeway_left_2_feature_geometry', 'bikeway_left_2_feature_geometry_projected',
+
+        # Bikeway Centerline (Right, 1)
+        'bikeway_right_1_id', 'bikeway_right_1_block_id', 'public_data_id_bikeway_right_1',
+        'bikeway_right_1_type', 'bikeway_right_1_surface', 'bikeway_right_1_quality',
+        'bikeway_right_1_permitted', 'bikeway_right_1_width', 'bikeway_right_1_incline',
+        'bikeway_right_buffered',
+
+        # Bikeway Centerline (Right, 2)
+        'bikeway_right_2_id', 'public_data_id_bikeway_right_2', 'bikeway_right_2_type',
+        'bikeway_right_2_surface', 'bikeway_right_2_quality', 'bikeway_right_2_permitted',
+        'bikeway_right_2_width', 'bikeway_right_2_incline',
+
+        # Bikeway Centerline Features (Right, 1)
         'bikeway_right_1_feature_ids', 'bikeway_right_1_feature_types',
-        'public_data_id_bikeway_right_1_features',
-        'bikeway_right_1_feature_geometry', 'bikeway_right_1_feature_geometry_projected',
+        'public_data_id_bikeway_right_1_features', 'bikeway_right_1_feature_geometry',
+        'bikeway_right_1_feature_geometry_projected',
+
+        # Bikeway Centerline Features (Right, 2)
         'bikeway_right_2_feature_types', 'public_data_id_bikeway_right_2_features',
         'bikeway_right_2_feature_geometry', 'bikeway_right_2_feature_geometry_projected',
-        
-        # Geometry columns (WKB)
+
+        # Main Geometry Columns
         'street_geometry', 'start_node_geometry', 'end_node_geometry',
-        'sidewalk_left_geometry', 'sidewalk_right_geometry',
-        'curb_return_geometry',
+        'sidewalk_left_geometry', 'sidewalk_right_geometry', 'curb_return_geometry',
         'bikeway_left_1_geometry', 'bikeway_left_2_geometry',
         'bikeway_right_1_geometry', 'bikeway_right_2_geometry',
     ]
@@ -366,141 +334,9 @@ def verify_parquet_file(config):
                 print(f"  ⚠ {col}: No data")
         else:
             print(f"  ✗ {col}: Column missing")
-    
-    # ========================================================================
-    # CURB RAMP TRUSTWORTHINESS VERIFICATION
-    # ========================================================================
-    print("\n" + "=" * 80)
-    print("CURB RAMP ASSIGNMENT VERIFICATION (TRUSTWORTHY=FALSE)")
-    print("=" * 80)
-    print("\nWhen curbramp_trustworthy=False, government ramp data should be IGNORED.")
-    print("Only default curb ramps (generated by the model) should be present.\n")
-    
-    # Count curb ramps by type
-    default_ramps = 0  # Ramps with ID but no public_data_id
-    government_ramps = 0  # Ramps with public_data_id
-    total_ramp_slots = 0
-    
-    ramp_details = {
-        'default': [],
-        'government': []
-    }
-    
-    for idx, row in df.iterrows():
-        for side in ['left', 'right']:
-            for slot in ['start', 'end']:
-                for pos in [1, 2, 3]:
-                    ramp_id = row.get(f'sidewalk_{side}_curbramp_{slot}_{pos}_ID')
-                    public_id = row.get(f'public_data_id_sidewalk_{side}_curbramp_{slot}_{pos}')
-                    ramp_geom = row.get(f'sidewalk_{side}_curbramp_{slot}_{pos}_geometry')
-                    
-                    if ramp_id is not None and not pd.isna(ramp_id):
-                        total_ramp_slots += 1
-                        
-                        if public_id is not None and not pd.isna(public_id):
-                            # Government ramp (should NOT exist when trustworthy=False)
-                            government_ramps += 1
-                            ramp_details['government'].append({
-                                'row_idx': idx,
-                                'osmid': row.get('street_osmid'),
-                                'side': side,
-                                'slot': slot,
-                                'pos': pos,
-                                'ramp_id': ramp_id,
-                                'public_id': public_id
-                            })
-                        else:
-                            # Default ramp (expected when trustworthy=False)
-                            default_ramps += 1
-                            ramp_details['default'].append({
-                                'row_idx': idx,
-                                'osmid': row.get('street_osmid'),
-                                'side': side,
-                                'slot': slot,
-                                'pos': pos,
-                                'ramp_id': ramp_id
-                            })
-    
-    print(f"CURB RAMP SUMMARY:")
-    print(f"  Total ramp slots with IDs: {total_ramp_slots}")
-    print(f"  Default ramps (no public_data_id): {default_ramps}")
-    print(f"  Government ramps (with public_data_id): {government_ramps}")
-    print()
-    
-    # Verification logic
-    if government_ramps > 0:
-        print(f"✗ FAILED: Found {government_ramps} government ramps when trustworthy=False")
-        print(f"  Government ramps should be IGNORED when trustworthy=False")
-        print(f"\n  Sample government ramps found:")
-        for i, ramp in enumerate(ramp_details['government'][:5]):
-            print(f"    {i+1}. Row {ramp['row_idx']}: osmid={ramp['osmid']}, "
-                  f"{ramp['side']}_{ramp['slot']}_{ramp['pos']}, "
-                  f"public_id={ramp['public_id']}")
-        if len(ramp_details['government']) > 5:
-            print(f"    ... and {len(ramp_details['government']) - 5} more")
-    else:
-        print(f"✓ PASSED: No government ramps found (correct for trustworthy=False)")
-    
-    print()
-    
-    if default_ramps > 0:
-        print(f"✓ PASSED: Found {default_ramps} default ramps (model-generated)")
-        print(f"  Sample default ramps:")
-        for i, ramp in enumerate(ramp_details['default'][:5]):
-            print(f"    {i+1}. Row {ramp['row_idx']}: osmid={ramp['osmid']}, "
-                  f"{ramp['side']}_{ramp['slot']}_{ramp['pos']}")
-        if len(ramp_details['default']) > 5:
-            print(f"    ... and {len(ramp_details['default']) - 5} more")
-    else:
-        print(f"⚠ WARNING: No default ramps found")
-        print(f"  This may be expected if no buffered sidewalks exist")
-    
-    # Check for curb return geometries
-    print("\nCURB RETURN GEOMETRY CHECK:")
-    curb_return_count = 0
-    if 'curb_return_geometry' in df.columns:
-        curb_return_count = df['curb_return_geometry'].notna().sum()
-        print(f"  Curb return geometries: {curb_return_count}")
-        if curb_return_count > 0:
-            print(f"  ⚠ Note: Curb returns are only generated from government ramps")
-            print(f"         With trustworthy=False, these should typically be 0")
-    else:
-        print(f"  ✗ curb_return_geometry column missing")
-    
-    # ========================================================================
-    # END CURB RAMP TRUSTWORTHINESS VERIFICATION
-    # ========================================================================
-    
-    # Verify block IDs
-    print("\nBLOCK ID VERIFICATION")
-    print("-" * 80)
-    if 'block_ids' in df.columns:
-        block_data = df['block_ids'].dropna()
-        if len(block_data) > 0:
-            print(f"  ✓ block_ids: {len(block_data)} rows with block assignments")
-            print(f"    Sample: {block_data.iloc[0]}")
-        else:
-            print(f"  ⚠ block_ids: No data")
-    else:
-        print(f"  ✗ block_ids: Column missing")
-    
-    # Verify normalized bearings
-    print("\nBEARING VERIFICATION")
-    print("-" * 80)
-    if 'normalized_bearing' in df.columns:
-        bearings = df['normalized_bearing'].dropna()
-        if len(bearings) > 0:
-            if bearings.between(0, 360).all():
-                print(f"  ✓ normalized_bearing: All values in [0, 360] range")
-                print(f"    Min: {bearings.min():.2f}°, Max: {bearings.max():.2f}°, Mean: {bearings.mean():.2f}°")
-            else:
-                print(f"  ✗ normalized_bearing: Values outside [0, 360] range")
-        else:
-            print(f"  ⚠ normalized_bearing: No data")
-    else:
-        print(f"  ✗ normalized_bearing: Column missing")
-    
+
     return df
+
 
 
 def find_feature_examples(df, city_name):

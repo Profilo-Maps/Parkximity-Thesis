@@ -26,6 +26,10 @@ __pycache__/
 /.kiro
 /.vscode
 /.idea
+specs
+.claudeignore
+CLAUDE.md
+/.claude
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/

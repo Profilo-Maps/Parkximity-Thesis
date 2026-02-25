@@ -21,6 +21,10 @@ dependencies:
 
   # Network Analysis
   - networkx=3.2.*
+  - osmnx=1.9.*
+
+  # Data Serialization
+  - pyarrow=14.*
 
   # Visualization
   - matplotlib=3.8.*
@@ -47,3 +51,4 @@ dependencies:
   - pip
   - pip:
     - scikit-learn
+    - torch
